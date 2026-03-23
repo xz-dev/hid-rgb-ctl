@@ -8,7 +8,6 @@ Provides two device classes:
 from __future__ import annotations
 
 import fcntl
-import os
 import struct
 from dataclasses import dataclass
 
@@ -84,22 +83,16 @@ class LampArrayDevice:
 
     def _feat_get(self, report_id: int, size: int) -> bytearray:
         """Read a HID Feature report."""
-        fd = os.open(self.path, os.O_RDWR)
-        try:
-            buf = bytearray(size + 1)  # +1 for report ID
-            buf[0] = report_id
-            fcntl.ioctl(fd, HIDIOCGFEATURE(len(buf)), buf)
-            return buf
-        finally:
-            os.close(fd)
+        buf = bytearray(size + 1)  # +1 for report ID
+        buf[0] = report_id
+        with open(self.path, "r+b", buffering=0) as f:
+            fcntl.ioctl(f, HIDIOCGFEATURE(len(buf)), buf)
+        return buf
 
     def _feat_set(self, buf: bytearray) -> None:
         """Write a HID Feature report."""
-        fd = os.open(self.path, os.O_RDWR)
-        try:
-            fcntl.ioctl(fd, HIDIOCSFEATURE(len(buf)), buf)
-        finally:
-            os.close(fd)
+        with open(self.path, "r+b", buffering=0) as f:
+            fcntl.ioctl(f, HIDIOCSFEATURE(len(buf)), buf)
 
     def get_attributes(self) -> LampArrayAttributes:
         """Read LampArrayAttributesReport (Section 26.2).
@@ -227,6 +220,18 @@ class LampArrayDevice:
         self._feat_set(buf)
 
 
+@dataclass
+class LedRgbAttributes:
+    """LED Page RGB device attributes (Section 11.7)."""
+
+    name: str
+    path: str
+    protocol: str
+    report_id: int
+    channel_size: int
+    has_intensity: bool
+
+
 class LedRgbDevice:
     """HID LED Page RGB LED (Usage Page 0x08, Section 11.7) control.
 
@@ -260,22 +265,19 @@ class LedRgbDevice:
         if info.intensity_offset is not None:
             buf[1 + info.intensity_offset] = intensity & 0xFF
 
-        fd = os.open(self.path, os.O_RDWR)
-        try:
-            fcntl.ioctl(fd, HIDIOCSFEATURE(len(buf)), buf)
-        finally:
-            os.close(fd)
+        with open(self.path, "r+b", buffering=0) as f:
+            fcntl.ioctl(f, HIDIOCSFEATURE(len(buf)), buf)
 
-    def get_attributes(self) -> dict:
+    def get_attributes(self) -> LedRgbAttributes:
         """Return basic device info (LED Page has no LampArray-style attributes)."""
-        return {
-            "name": self.name,
-            "path": self.path,
-            "protocol": "LED Page RGB (Usage Page 0x08, Section 11.7)",
-            "report_id": self.info.report_id,
-            "channel_size": self.info.channel_size,
-            "has_intensity": self.info.intensity_offset is not None,
-        }
+        return LedRgbAttributes(
+            name=self.name,
+            path=self.path,
+            protocol="LED Page RGB (Usage Page 0x08, Section 11.7)",
+            report_id=self.info.report_id,
+            channel_size=self.info.channel_size,
+            has_intensity=self.info.intensity_offset is not None,
+        )
 
     def set_autonomous(self, enabled: bool) -> None:
         """Not supported on LED Page 0x08 — no AutonomousMode concept."""

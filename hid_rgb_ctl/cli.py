@@ -133,12 +133,12 @@ def cmd_get(info: LampArrayInfo | LedRgbInfo) -> None:
             print(f"  Programmable: {'yes' if lamp.is_programmable else 'no'}")
     else:
         attrs = dev.get_attributes()
-        print(f"Device: {attrs['name']}")
-        print(f"Protocol: {attrs['protocol']}")
-        print(f"Path: {attrs['path']}")
-        print(f"Report ID: 0x{attrs['report_id']:02x}")
-        print(f"Channel size: {attrs['channel_size']} bits")
-        print(f"Has intensity: {'yes' if attrs['has_intensity'] else 'no'}")
+        print(f"Device: {attrs.name}")
+        print(f"Protocol: {attrs.protocol}")
+        print(f"Path: {attrs.path}")
+        print(f"Report ID: 0x{attrs.report_id:02x}")
+        print(f"Channel size: {attrs.channel_size} bits")
+        print(f"Has intensity: {'yes' if attrs.has_intensity else 'no'}")
 
 
 def cmd_set(
@@ -236,17 +236,31 @@ def main() -> None:
             )
         sys.exit(1)
 
-    if args.command == "get":
-        cmd_get(info)
-    elif args.command == "set":
-        color = _parse_color(args.color)
-        if color is None:
-            print(
-                f"Error: Invalid color. Use a preset ({', '.join(PRESETS)}), "
-                "R G B values (0-255), or a 6-digit hex code.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        cmd_set(info, *color, intensity=args.intensity)
-    elif args.command == "auto":
-        cmd_auto(info, args.state == "on")
+    try:
+        if args.command == "get":
+            cmd_get(info)
+        elif args.command == "set":
+            color = _parse_color(args.color)
+            if color is None:
+                print(
+                    f"Error: Invalid color. Use a preset ({', '.join(PRESETS)}), "
+                    "R G B values (0-255), or a 6-digit hex code.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            cmd_set(info, *color, intensity=args.intensity)
+        elif args.command == "auto":
+            cmd_auto(info, args.state == "on")
+    except PermissionError:
+        print(
+            f"Error: Permission denied on {info.hidraw_path}.",
+            file=sys.stderr,
+        )
+        print(
+            "Run with sudo or set up a udev rule — see README.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
