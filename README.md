@@ -1,4 +1,4 @@
-# hid-rgb-ctl
+# [hid-rgb-ctl](https://github.com/xz-dev/hid-rgb-ctl)
 
 Linux command-line tool for controlling RGB lighting via standard HID protocols.
 
