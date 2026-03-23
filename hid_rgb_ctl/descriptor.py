@@ -11,7 +11,6 @@ Reference: USB HID Usage Tables v1.4
 
 from __future__ import annotations
 
-import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,11 +120,12 @@ class _ParserState:
     logical_max: int = 0
 
     # Local items (reset after each Main item)
-    usages: list[int] = field(default_factory=list)
+    # Stores int (usage ID) or tuple ("min", usage_min) awaiting USAGE_MAX
+    usages: list[int | tuple[str, int]] = field(default_factory=list)
 
     # Tracking for report size calculation
-    # Maps (usage_page, report_id) -> accumulated bit offset
-    report_bit_offsets: dict[tuple[int, int], int] = field(default_factory=dict)
+    # Maps (usage_page|"led", report_id) -> accumulated bit offset
+    report_bit_offsets: dict[tuple[int | str, int], int] = field(default_factory=dict)
 
     # Collection depth tracking
     collection_depth: int = 0
@@ -218,11 +218,8 @@ def _parse_descriptor(
     lamp_array_reports: dict[str, ReportInfo] = {}
     led_rgb_channels: dict[int, dict] = {}  # report_id -> channel info
 
-    # Track which report_id + usage_page combos we've seen collection usages for
-    current_collection_usage: int | None = None
     current_lighting_report_name: str | None = None
     in_rgb_led_collection = False
-    rgb_led_report_id: int | None = None
 
     # Per-report accumulated sizes for final report size calculation
     report_data_bits: dict[int, int] = {}  # report_id -> total data bits
@@ -258,7 +255,6 @@ def _parse_descriptor(
         elif tag == _TAG_USAGE:
             state.usages.append(val)
         elif tag == _TAG_USAGE_MIN:
-            usage_min = val
             # Wait for USAGE_MAX to expand the range
             state.usages.append(("min", val))
         elif tag == _TAG_USAGE_MAX:
@@ -274,15 +270,12 @@ def _parse_descriptor(
             if state.usage_page == USAGE_PAGE_LIGHTING:
                 for usage in state.usages:
                     if isinstance(usage, int) and usage in _LAMP_ARRAY_REPORT_USAGES:
-                        current_lighting_report_name = _LAMP_ARRAY_REPORT_USAGES[
-                            usage
-                        ]
+                        current_lighting_report_name = _LAMP_ARRAY_REPORT_USAGES[usage]
             # Check for RGB LED collection on LED Page
             if state.usage_page == USAGE_PAGE_LED:
                 for usage in state.usages:
                     if usage == USAGE_RGB_LED:
                         in_rgb_led_collection = True
-                        rgb_led_report_id = state.report_id
                         if state.report_id not in led_rgb_channels:
                             led_rgb_channels[state.report_id] = {}
             state.clear_local()

@@ -16,8 +16,15 @@ from hid_rgb_ctl.descriptor import LampArrayInfo, LedRgbInfo
 # Linux HIDRAW ioctl numbers
 # HIDIOCGFEATURE = _IOC(_IOC_READ|_IOC_WRITE, 'H', 0x07, len)
 # HIDIOCSFEATURE = _IOC(_IOC_READ|_IOC_WRITE, 'H', 0x06, len)
-HIDIOCGFEATURE = lambda size: 0xC0004807 | (size << 16)
-HIDIOCSFEATURE = lambda size: 0xC0004806 | (size << 16)
+
+
+def HIDIOCGFEATURE(size: int) -> int:
+    return 0xC0004807 | (size << 16)
+
+
+def HIDIOCSFEATURE(size: int) -> int:
+    return 0xC0004806 | (size << 16)
+
 
 # LampArrayKind values (Section 26.2.1)
 LAMP_ARRAY_KINDS = {
@@ -147,9 +154,7 @@ class LampArrayDevice:
         #          BlueCount(8), IntensityCount(8), IsProgrammable(8),
         #          InputBinding(8)]
         lamp_id = struct.unpack_from("<H", buf, 1)[0]
-        pos_x, pos_y, pos_z, latency, purposes = struct.unpack_from(
-            "<IIIII", buf, 3
-        )
+        pos_x, pos_y, pos_z, latency, purposes = struct.unpack_from("<IIIII", buf, 3)
         r_cnt, g_cnt, b_cnt, i_cnt, prog, binding = struct.unpack_from(
             "<BBBBBB", buf, 23
         )

@@ -23,9 +23,7 @@ PRESETS = {
 }
 
 
-def _find_device(
-    devices: list, path: str | None
-) -> LampArrayInfo | LedRgbInfo | None:
+def _find_device(devices: list, path: str | None) -> LampArrayInfo | LedRgbInfo | None:
     """Find a device by path, or return the first one."""
     if not devices:
         return None
@@ -84,10 +82,7 @@ def cmd_list(devices: list) -> None:
             dev = LampArrayDevice(d)
             try:
                 attrs = dev.get_attributes()
-                detail = (
-                    f"LampArray  {attrs.lamp_count} lamp(s), "
-                    f"{attrs.kind_name}"
-                )
+                detail = f"LampArray  {attrs.lamp_count} lamp(s), {attrs.kind_name}"
             except Exception:
                 detail = "LampArray"
         else:
@@ -102,7 +97,7 @@ def cmd_get(info: LampArrayInfo | LedRgbInfo) -> None:
     if isinstance(dev, LampArrayDevice):
         attrs = dev.get_attributes()
         print(f"Device: {dev.name}")
-        print(f"Protocol: HID LampArray (Usage Page 0x59)")
+        print("Protocol: HID LampArray (Usage Page 0x59)")
         print(f"Path: {dev.path}")
         print(f"Lamps: {attrs.lamp_count}")
         print(f"Kind: {attrs.kind_name}")
@@ -230,8 +225,7 @@ def main() -> None:
         else:
             print("Error: No HID RGB devices found.", file=sys.stderr)
             print(
-                "Check permissions on /dev/hidraw* — "
-                "see README for udev setup.",
+                "Check permissions on /dev/hidraw* — see README for udev setup.",
                 file=sys.stderr,
             )
         sys.exit(1)
