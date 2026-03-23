@@ -30,8 +30,8 @@ Linux command-line tool for controlling RGB lighting via standard HID protocols.
 ## Install
 
 ```sh
-pip install .
-# or
+pipx install git+https://github.com/xz-dev/hid-rgb-ctl.git
+# or from local clone
 pipx install .
 ```
 
