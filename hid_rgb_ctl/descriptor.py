@@ -56,6 +56,29 @@ _LAMP_ARRAY_REPORT_USAGES = {
     USAGE_LAMP_ARRAY_CONTROL_REPORT: "control",
 }
 
+# HID item tags (prefix byte with size bits masked out)
+# Global items
+_TAG_USAGE_PAGE = 0x04
+_TAG_LOGICAL_MIN = 0x14
+_TAG_LOGICAL_MAX = 0x24
+_TAG_REPORT_SIZE = 0x74
+_TAG_REPORT_ID = 0x84
+_TAG_REPORT_COUNT = 0x94
+
+# Local items
+_TAG_USAGE = 0x08
+_TAG_USAGE_MIN = 0x18
+_TAG_USAGE_MAX = 0x28
+
+# Main items
+_TAG_INPUT = 0x80
+_TAG_OUTPUT = 0x90
+_TAG_FEATURE = 0xB0
+_TAG_COLLECTION = 0xA0
+_TAG_END_COLLECTION = 0xC0
+
+_MAIN_DATA_TAGS = frozenset({_TAG_INPUT, _TAG_OUTPUT, _TAG_FEATURE})
+
 
 @dataclass
 class ReportInfo:
@@ -108,10 +131,41 @@ class LedRgbInfo:
 
 
 @dataclass
-class _ParserState:
-    """Mutable state for the HID descriptor parser."""
+class _LedRgbChannelBuilder:
+    """Accumulates LED RGB channel offsets during descriptor parsing."""
 
-    # Global items (persist across Main items)
+    report_id: int = 0
+    report_size: int = 0  # Filled in during finalize()
+    red_offset: int | None = None
+    blue_offset: int | None = None
+    green_offset: int | None = None
+    intensity_offset: int | None = None
+    channel_size: int = 8
+
+    @property
+    def is_complete(self) -> bool:
+        """True when all mandatory channels (R, G, B) have been found."""
+        return (
+            self.red_offset is not None
+            and self.blue_offset is not None
+            and self.green_offset is not None
+        )
+
+
+# Usage type stored in usages list — either a plain int (usage ID)
+# or a tuple ("min", value) awaiting a USAGE_MAX to expand the range.
+_UsageEntry = int | tuple[str, int]
+
+
+@dataclass
+class _ParserState:
+    """Mutable state for the HID descriptor parser.
+
+    Handles global, local, and main HID items, accumulating results into
+    lamp_array_reports and led_rgb_channels.
+    """
+
+    # --- Global items (persist across Main items) ---
     usage_page: int = 0
     report_id: int = 0
     report_size: int = 0
@@ -119,29 +173,149 @@ class _ParserState:
     logical_min: int = 0
     logical_max: int = 0
 
-    # Local items (reset after each Main item)
-    # Stores int (usage ID) or tuple ("min", usage_min) awaiting USAGE_MAX
-    usages: list[int | tuple[str, int]] = field(default_factory=list)
+    # --- Local items (reset after each Main item) ---
+    usages: list[_UsageEntry] = field(default_factory=list)
 
-    # Tracking for report size calculation
-    # Maps (usage_page|"led", report_id) -> accumulated bit offset
-    report_bit_offsets: dict[tuple[int | str, int], int] = field(default_factory=dict)
+    # --- Accumulated results ---
+    lamp_array_reports: dict[str, ReportInfo] = field(default_factory=dict)
+    led_rgb_channels: dict[int, _LedRgbChannelBuilder] = field(default_factory=dict)
 
-    # Collection depth tracking
+    # Per-report accumulated data bits for final size calculation
+    report_data_bits: dict[int, int] = field(default_factory=dict)
+
+    # Per-(usage_page, report_id) bit offset tracking
+    _report_bit_offsets: dict[tuple[int | str, int], int] = field(default_factory=dict)
+
+    # Collection / context tracking
     collection_depth: int = 0
+    current_lighting_report_name: str | None = None
+    in_rgb_led_collection: bool = False
 
-    def _report_key(self) -> tuple[int, int]:
-        return (self.usage_page, self.report_id)
+    # --- Global item handlers ---
 
-    def current_bit_offset(self) -> int:
-        return self.report_bit_offsets.get(self._report_key(), 0)
+    def handle_global(self, tag: int, val: int, payload: bytes) -> None:
+        if tag == _TAG_USAGE_PAGE:
+            self.usage_page = val
+        elif tag == _TAG_REPORT_ID:
+            self.report_id = val
+        elif tag == _TAG_REPORT_SIZE:
+            self.report_size = val
+        elif tag == _TAG_REPORT_COUNT:
+            self.report_count = val
+        elif tag == _TAG_LOGICAL_MIN:
+            self.logical_min = _payload_value(payload, signed=True)
+        elif tag == _TAG_LOGICAL_MAX:
+            self.logical_max = _payload_value(payload, signed=True)
 
-    def advance_bits(self, bits: int) -> None:
-        key = self._report_key()
-        self.report_bit_offsets[key] = self.report_bit_offsets.get(key, 0) + bits
+    # --- Local item handlers ---
 
-    def clear_local(self) -> None:
-        self.usages = []
+    def handle_local(self, tag: int, val: int) -> None:
+        if tag == _TAG_USAGE:
+            self.usages.append(val)
+        elif tag == _TAG_USAGE_MIN:
+            self.usages.append(("min", val))
+        elif tag == _TAG_USAGE_MAX:
+            # Expand usage range from the last USAGE_MIN
+            if self.usages and isinstance(self.usages[-1], tuple):
+                _, umin = self.usages.pop()
+                self.usages.extend(range(umin, val + 1))
+
+    # --- Main item handlers ---
+
+    def handle_main(self, tag: int) -> None:
+        if tag == _TAG_COLLECTION:
+            self._on_collection()
+        elif tag == _TAG_END_COLLECTION:
+            self._on_end_collection()
+        elif tag in _MAIN_DATA_TAGS:
+            self._on_data_item()
+
+    def _on_collection(self) -> None:
+        self.collection_depth += 1
+
+        if self.usage_page == USAGE_PAGE_LIGHTING:
+            for usage in self.usages:
+                if isinstance(usage, int) and usage in _LAMP_ARRAY_REPORT_USAGES:
+                    self.current_lighting_report_name = _LAMP_ARRAY_REPORT_USAGES[usage]
+
+        if self.usage_page == USAGE_PAGE_LED:
+            for usage in self.usages:
+                if usage == USAGE_RGB_LED:
+                    self.in_rgb_led_collection = True
+                    self.led_rgb_channels.setdefault(
+                        self.report_id, _LedRgbChannelBuilder()
+                    )
+
+        self.usages.clear()
+
+    def _on_end_collection(self) -> None:
+        self.collection_depth -= 1
+        if self.collection_depth <= 1:
+            self.current_lighting_report_name = None
+            self.in_rgb_led_collection = False
+        self.usages.clear()
+
+    def _on_data_item(self) -> None:
+        total_bits = self.report_size * self.report_count
+        rid = self.report_id
+        self.report_data_bits[rid] = self.report_data_bits.get(rid, 0) + total_bits
+
+        # Lighting Page (0x59): record report info
+        if (
+            self.usage_page == USAGE_PAGE_LIGHTING
+            and self.current_lighting_report_name is not None
+        ):
+            self.lamp_array_reports.setdefault(
+                self.current_lighting_report_name,
+                ReportInfo(report_id=rid, size=0),
+            )
+
+        # LED Page (0x08): record channel byte offsets
+        if self.usage_page == USAGE_PAGE_LED and self.in_rgb_led_collection:
+            builder = self.led_rgb_channels.setdefault(rid, _LedRgbChannelBuilder())
+            bit_key = ("led", rid)
+            current_bits = self._report_bit_offsets.get(bit_key, 0)
+
+            _CHANNEL_SETTERS = {
+                USAGE_RED_LED_CHANNEL: "red_offset",
+                USAGE_BLUE_LED_CHANNEL: "blue_offset",
+                USAGE_GREEN_LED_CHANNEL: "green_offset",
+                USAGE_LED_INTENSITY: "intensity_offset",
+            }
+
+            for i, usage in enumerate(self.usages):
+                if not isinstance(usage, int):
+                    continue
+                byte_off = (current_bits + i * self.report_size) // 8
+                attr = _CHANNEL_SETTERS.get(usage)
+                if attr is not None:
+                    setattr(builder, attr, byte_off)
+                if usage == USAGE_RED_LED_CHANNEL:
+                    builder.channel_size = self.report_size
+
+            self._report_bit_offsets[bit_key] = current_bits + total_bits
+
+        self.usages.clear()
+
+    # --- Finalize ---
+
+    def finalize(self) -> tuple[dict[str, ReportInfo], list[_LedRgbChannelBuilder]]:
+        """Compute final report sizes and return parsed results."""
+        # Fill in byte sizes for LampArray reports
+        for rinfo in self.lamp_array_reports.values():
+            bits = self.report_data_bits.get(rinfo.report_id, 0)
+            rinfo.size = (bits + 7) // 8
+
+        # Collect complete LED RGB channel builders with computed sizes
+        complete = []
+        for rid, builder in self.led_rgb_channels.items():
+            if builder.is_complete:
+                builder.report_id = rid
+                bits = self.report_data_bits.get(rid, 0)
+                builder.report_size = (bits + 7) // 8
+                complete.append(builder)
+
+        return self.lamp_array_reports, complete
 
 
 def _parse_item(data: bytes, offset: int) -> tuple[int, int, bytes]:
@@ -172,59 +346,30 @@ def _payload_value(payload: bytes, signed: bool = False) -> int:
     """Decode a HID item payload as an integer."""
     if not payload:
         return 0
-    if signed:
-        fmt = {1: "<b", 2: "<h", 4: "<i"}.get(len(payload))
-    else:
-        fmt = {1: "<B", 2: "<H", 4: "<I"}.get(len(payload))
+    fmt = {
+        1: "<b" if signed else "<B",
+        2: "<h" if signed else "<H",
+        4: "<i" if signed else "<I",
+    }.get(len(payload))
     if fmt is None:
         return int.from_bytes(payload, "little", signed=signed)
     return struct.unpack(fmt, payload)[0]
 
 
-# HID item tags (prefix byte with size bits masked out)
-# Global items
-_TAG_USAGE_PAGE = 0x04
-_TAG_LOGICAL_MIN = 0x14
-_TAG_LOGICAL_MAX = 0x24
-_TAG_REPORT_SIZE = 0x74
-_TAG_REPORT_ID = 0x84
-_TAG_REPORT_COUNT = 0x94
-
-# Local items
-_TAG_USAGE = 0x08
-_TAG_USAGE_MIN = 0x18
-_TAG_USAGE_MAX = 0x28
-
-# Main items
-_TAG_INPUT = 0x80
-_TAG_OUTPUT = 0x90
-_TAG_FEATURE = 0xB0
-_TAG_COLLECTION = 0xA0
-_TAG_END_COLLECTION = 0xC0
-
-
 def _parse_descriptor(
     desc: bytes,
-) -> tuple[dict[str, ReportInfo], list[dict]]:
+) -> tuple[dict[str, ReportInfo], list[_LedRgbChannelBuilder]]:
     """Parse a binary HID report descriptor.
 
     Returns:
         lamp_array_reports: dict mapping report name -> ReportInfo
             for Lighting and Illumination Page (0x59)
-        led_rgb_reports: list of dicts with LED Page (0x08) RGB LED info,
-            each containing report_id, channel offsets, and sizes
+        led_rgb_builders: list of _LedRgbChannelBuilder with LED Page (0x08)
+            RGB LED channel info
     """
     state = _ParserState()
-    lamp_array_reports: dict[str, ReportInfo] = {}
-    led_rgb_channels: dict[int, dict] = {}  # report_id -> channel info
-
-    current_lighting_report_name: str | None = None
-    in_rgb_led_collection = False
-
-    # Per-report accumulated sizes for final report size calculation
-    report_data_bits: dict[int, int] = {}  # report_id -> total data bits
-
     offset = 0
+
     while offset < len(desc):
         try:
             tag, item_type, payload = _parse_item(desc, offset)
@@ -237,125 +382,14 @@ def _parse_descriptor(
         offset += 1 + size
         val = _payload_value(payload)
 
-        # --- Global items ---
-        if tag == _TAG_USAGE_PAGE:
-            state.usage_page = val
-        elif tag == _TAG_REPORT_ID:
-            state.report_id = val
-        elif tag == _TAG_REPORT_SIZE:
-            state.report_size = val
-        elif tag == _TAG_REPORT_COUNT:
-            state.report_count = val
-        elif tag == _TAG_LOGICAL_MIN:
-            state.logical_min = _payload_value(payload, signed=True)
-        elif tag == _TAG_LOGICAL_MAX:
-            state.logical_max = _payload_value(payload, signed=True)
+        if item_type == 1:  # Global
+            state.handle_global(tag, val, payload)
+        elif item_type == 2:  # Local
+            state.handle_local(tag, val)
+        elif item_type == 0:  # Main
+            state.handle_main(tag)
 
-        # --- Local items ---
-        elif tag == _TAG_USAGE:
-            state.usages.append(val)
-        elif tag == _TAG_USAGE_MIN:
-            # Wait for USAGE_MAX to expand the range
-            state.usages.append(("min", val))
-        elif tag == _TAG_USAGE_MAX:
-            # Expand usage range from last USAGE_MIN
-            if state.usages and isinstance(state.usages[-1], tuple):
-                _, umin = state.usages.pop()
-                state.usages.extend(range(umin, val + 1))
-
-        # --- Main items ---
-        elif tag == _TAG_COLLECTION:
-            state.collection_depth += 1
-            # Check if this collection starts a known LampArray report
-            if state.usage_page == USAGE_PAGE_LIGHTING:
-                for usage in state.usages:
-                    if isinstance(usage, int) and usage in _LAMP_ARRAY_REPORT_USAGES:
-                        current_lighting_report_name = _LAMP_ARRAY_REPORT_USAGES[usage]
-            # Check for RGB LED collection on LED Page
-            if state.usage_page == USAGE_PAGE_LED:
-                for usage in state.usages:
-                    if usage == USAGE_RGB_LED:
-                        in_rgb_led_collection = True
-                        if state.report_id not in led_rgb_channels:
-                            led_rgb_channels[state.report_id] = {}
-            state.clear_local()
-
-        elif tag == _TAG_END_COLLECTION:
-            state.collection_depth -= 1
-            if state.collection_depth <= 1:
-                current_lighting_report_name = None
-            if in_rgb_led_collection and state.collection_depth <= 1:
-                in_rgb_led_collection = False
-            state.clear_local()
-
-        elif tag in (_TAG_INPUT, _TAG_OUTPUT, _TAG_FEATURE):
-            total_bits = state.report_size * state.report_count
-
-            # Track report data sizes
-            rid = state.report_id
-            report_data_bits[rid] = report_data_bits.get(rid, 0) + total_bits
-
-            # --- Lighting Page (0x59): record report info ---
-            if (
-                state.usage_page == USAGE_PAGE_LIGHTING
-                and current_lighting_report_name is not None
-            ):
-                rname = current_lighting_report_name
-                if rname not in lamp_array_reports:
-                    lamp_array_reports[rname] = ReportInfo(
-                        report_id=state.report_id, size=0
-                    )
-
-            # --- LED Page (0x08): record channel byte offsets ---
-            if state.usage_page == USAGE_PAGE_LED and in_rgb_led_collection:
-                rid = state.report_id
-                if rid not in led_rgb_channels:
-                    led_rgb_channels[rid] = {}
-                channels = led_rgb_channels[rid]
-
-                # Calculate current byte offset within this report's data
-                # We need per-report tracking
-                bit_key = ("led", rid)
-                current_bits = state.report_bit_offsets.get(bit_key, 0)
-
-                for i, usage in enumerate(state.usages):
-                    if not isinstance(usage, int):
-                        continue
-                    byte_off = (current_bits + i * state.report_size) // 8
-                    if usage == USAGE_RED_LED_CHANNEL:
-                        channels["red_offset"] = byte_off
-                        channels["channel_size"] = state.report_size
-                    elif usage == USAGE_BLUE_LED_CHANNEL:
-                        channels["blue_offset"] = byte_off
-                    elif usage == USAGE_GREEN_LED_CHANNEL:
-                        channels["green_offset"] = byte_off
-                    elif usage == USAGE_LED_INTENSITY:
-                        channels["intensity_offset"] = byte_off
-
-                state.report_bit_offsets[bit_key] = current_bits + total_bits
-
-            state.clear_local()
-
-    # Compute final report sizes (bytes) for LampArray reports
-    for rname, rinfo in lamp_array_reports.items():
-        bits = report_data_bits.get(rinfo.report_id, 0)
-        rinfo.size = (bits + 7) // 8
-
-    # Build LED RGB info list
-    led_rgb_reports = []
-    for rid, channels in led_rgb_channels.items():
-        if "red_offset" in channels and "green_offset" in channels:
-            bits = report_data_bits.get(rid, 0)
-            led_rgb_reports.append(
-                {
-                    "report_id": rid,
-                    "report_size": (bits + 7) // 8,
-                    "channel_size": channels.get("channel_size", 8),
-                    **channels,
-                }
-            )
-
-    return lamp_array_reports, led_rgb_reports
+    return state.finalize()
 
 
 # --- Device Discovery ---
@@ -403,11 +437,10 @@ def discover_devices() -> list[LampArrayInfo | LedRgbInfo]:
             continue
 
         hidraw_name = entry.name
-        lamp_reports, led_rgb_reports = _parse_descriptor(desc_bytes)
+        lamp_reports, led_rgb_builders = _parse_descriptor(desc_bytes)
 
         # Check for LampArray (Usage Page 0x59)
         if lamp_reports:
-            # Must have at least the essential reports
             required = {"range_update", "control"}
             if required.issubset(lamp_reports.keys()):
                 devices.append(
@@ -419,20 +452,22 @@ def discover_devices() -> list[LampArrayInfo | LedRgbInfo]:
                 )
 
         # Check for LED Page RGB LED (Usage Page 0x08)
-        for rgb_info in led_rgb_reports:
-            if "blue_offset" not in rgb_info:
-                continue
+        for builder in led_rgb_builders:
+            # is_complete guarantees red/blue/green offsets are not None
+            assert builder.red_offset is not None
+            assert builder.blue_offset is not None
+            assert builder.green_offset is not None
             devices.append(
                 LedRgbInfo(
                     hidraw_path=f"/dev/{hidraw_name}",
                     name=_get_hid_name(hidraw_name),
-                    report_id=rgb_info["report_id"],
-                    report_size=rgb_info["report_size"],
-                    red_offset=rgb_info["red_offset"],
-                    blue_offset=rgb_info["blue_offset"],
-                    green_offset=rgb_info["green_offset"],
-                    intensity_offset=rgb_info.get("intensity_offset"),
-                    channel_size=rgb_info.get("channel_size", 8),
+                    report_id=builder.report_id,
+                    report_size=builder.report_size,
+                    red_offset=builder.red_offset,
+                    blue_offset=builder.blue_offset,
+                    green_offset=builder.green_offset,
+                    intensity_offset=builder.intensity_offset,
+                    channel_size=builder.channel_size,
                 )
             )
 

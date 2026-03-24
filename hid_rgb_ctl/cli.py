@@ -35,7 +35,7 @@ def _find_device(devices: list, path: str | None) -> LampArrayInfo | LedRgbInfo 
     return None
 
 
-def _make_device(info: LampArrayInfo | LedRgbInfo):
+def _make_device(info: LampArrayInfo | LedRgbInfo) -> LampArrayDevice | LedRgbDevice:
     """Create the appropriate device object from info."""
     if isinstance(info, LampArrayInfo):
         return LampArrayDevice(info)
@@ -78,16 +78,8 @@ def cmd_list(devices: list) -> None:
         return
 
     for d in devices:
-        if isinstance(d, LampArrayInfo):
-            dev = LampArrayDevice(d)
-            try:
-                attrs = dev.get_attributes()
-                detail = f"LampArray  {attrs.lamp_count} lamp(s), {attrs.kind_name}"
-            except Exception:
-                detail = "LampArray"
-        else:
-            detail = "LED RGB"
-        print(f"{d.hidraw_path}  {d.name}  {detail}")
+        dev = _make_device(d)
+        print(f"{d.hidraw_path}  {d.name}  {dev.summary()}")
 
 
 def cmd_get(info: LampArrayInfo | LedRgbInfo) -> None:
@@ -151,13 +143,16 @@ def cmd_set(
 def cmd_auto(info: LampArrayInfo | LedRgbInfo, enabled: bool) -> None:
     """Toggle autonomous mode."""
     dev = _make_device(info)
-    try:
-        dev.set_autonomous(enabled)
-        state = "on (device controls)" if enabled else "off (host controls)"
-        print(f"Autonomous mode: {state}")
-    except NotImplementedError as e:
-        print(f"Error: {e}", file=sys.stderr)
+    if not hasattr(dev, "set_autonomous"):
+        print(
+            "Error: This device does not support autonomous mode. "
+            "Only LampArray (Usage Page 0x59) devices have this feature.",
+            file=sys.stderr,
+        )
         sys.exit(1)
+    dev.set_autonomous(enabled)
+    state = "on (device controls)" if enabled else "off (host controls)"
+    print(f"Autonomous mode: {state}")
 
 
 def main() -> None:

@@ -8,7 +8,9 @@ Provides two device classes:
 from __future__ import annotations
 
 import fcntl
+import io
 import struct
+import warnings
 from dataclasses import dataclass
 
 from hid_rgb_ctl.descriptor import LampArrayInfo, LedRgbInfo
@@ -73,7 +75,70 @@ class LampArrayAttributes:
     min_update_interval_us: int
 
 
-class LampArrayDevice:
+@dataclass
+class LedRgbAttributes:
+    """LED Page RGB device attributes (Section 11.7)."""
+
+    name: str
+    path: str
+    protocol: str
+    report_id: int
+    channel_size: int
+    has_intensity: bool
+
+
+class _HidDevice:
+    """Base for hidraw devices with shared ioctl helpers and context manager.
+
+    Use as a context manager to batch multiple ioctl calls on a single fd::
+
+        with device:
+            device.set_autonomous(False)
+            device.set_color(255, 0, 0)
+
+    Without the context manager, each call opens/closes the fd individually.
+    """
+
+    def __init__(self, info: LampArrayInfo | LedRgbInfo) -> None:
+        self.info = info
+        self.path = info.hidraw_path
+        self.name = info.name
+        self._fd: io.FileIO | None = None
+
+    # -- context manager for fd batching --
+
+    def __enter__(self) -> _HidDevice:
+        self._fd = open(self.path, "r+b", buffering=0)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._fd is not None:
+            self._fd.close()
+            self._fd = None
+
+    # -- low-level HID feature report I/O --
+
+    def _ioctl(self, request: int, buf: bytearray) -> None:
+        """Issue an ioctl, using the batched fd if open, else a one-shot fd."""
+        if self._fd is not None:
+            fcntl.ioctl(self._fd, request, buf)
+        else:
+            with open(self.path, "r+b", buffering=0) as f:
+                fcntl.ioctl(f, request, buf)
+
+    def _feat_get(self, report_id: int, size: int) -> bytearray:
+        """Read a HID Feature report."""
+        buf = bytearray(size + 1)  # +1 for report ID
+        buf[0] = report_id
+        self._ioctl(HIDIOCGFEATURE(len(buf)), buf)
+        return buf
+
+    def _feat_set(self, buf: bytearray) -> None:
+        """Write a HID Feature report."""
+        self._ioctl(HIDIOCSFEATURE(len(buf)), buf)
+
+
+class LampArrayDevice(_HidDevice):
     """HID LampArray (Usage Page 0x59) control.
 
     Implements the LampArray operation flow per HUT v1.4 Section 26.6:
@@ -82,24 +147,16 @@ class LampArrayDevice:
     Report IDs and sizes come from descriptor parsing, not hardcoded.
     """
 
-    def __init__(self, info: LampArrayInfo):
-        self.info = info
-        self.path = info.hidraw_path
-        self.name = info.name
+    def __init__(self, info: LampArrayInfo) -> None:
+        super().__init__(info)
         self._reports = info.reports
 
-    def _feat_get(self, report_id: int, size: int) -> bytearray:
-        """Read a HID Feature report."""
-        buf = bytearray(size + 1)  # +1 for report ID
-        buf[0] = report_id
-        with open(self.path, "r+b", buffering=0) as f:
-            fcntl.ioctl(f, HIDIOCGFEATURE(len(buf)), buf)
-        return buf
-
-    def _feat_set(self, buf: bytearray) -> None:
-        """Write a HID Feature report."""
-        with open(self.path, "r+b", buffering=0) as f:
-            fcntl.ioctl(f, HIDIOCSFEATURE(len(buf)), buf)
+    def _require_report(self, name: str):
+        """Return a report's info or raise with a helpful message."""
+        rinfo = self._reports.get(name)
+        if rinfo is None:
+            raise RuntimeError(f"Device has no {name!r} report")
+        return rinfo
 
     def get_attributes(self) -> LampArrayAttributes:
         """Read LampArrayAttributesReport (Section 26.2).
@@ -107,11 +164,9 @@ class LampArrayDevice:
         Returns lamp count, bounding box dimensions, device kind,
         and minimum update interval.
         """
-        rinfo = self._reports.get("attributes")
-        if rinfo is None:
-            raise RuntimeError("Device has no LampArrayAttributesReport")
-
+        rinfo = self._require_report("attributes")
         buf = self._feat_get(rinfo.report_id, rinfo.size)
+
         # Layout: [ReportID, LampCount(16), Width(32), Height(32),
         #          Depth(32), Kind(32), MinInterval(32)]
         lamp_count = struct.unpack_from("<H", buf, 1)[0]
@@ -133,22 +188,15 @@ class LampArrayDevice:
         Sends LampAttributesRequestReport with the lamp index,
         then reads LampAttributesResponseReport.
         """
-        # Write request
-        req_info = self._reports.get("attr_request")
-        if req_info is None:
-            raise RuntimeError("Device has no LampAttributesRequestReport")
-
+        req_info = self._require_report("attr_request")
         req_buf = bytearray(req_info.size + 1)
         req_buf[0] = req_info.report_id
         struct.pack_into("<H", req_buf, 1, index)
         self._feat_set(req_buf)
 
-        # Read response
-        resp_info = self._reports.get("attr_response")
-        if resp_info is None:
-            raise RuntimeError("Device has no LampAttributesResponseReport")
-
+        resp_info = self._require_report("attr_response")
         buf = self._feat_get(resp_info.report_id, resp_info.size)
+
         # Layout: [ReportID, LampId(16), PosX(32), PosY(32), PosZ(32),
         #          Latency(32), Purposes(32), RedCount(8), GreenCount(8),
         #          BlueCount(8), IntensityCount(8), IsProgrammable(8),
@@ -181,10 +229,7 @@ class LampArrayDevice:
         When False: host has exclusive control, device ignores its own effects.
         Default device state is True (autonomous).
         """
-        ctrl_info = self._reports.get("control")
-        if ctrl_info is None:
-            raise RuntimeError("Device has no LampArrayControlReport")
-
+        ctrl_info = self._require_report("control")
         buf = bytearray(ctrl_info.size + 1)
         buf[0] = ctrl_info.report_id
         buf[1] = 0x01 if enabled else 0x00
@@ -196,48 +241,53 @@ class LampArrayDevice:
         Disables autonomous mode, then sends a LampRangeUpdate covering
         all lamps (LampIdStart=0, LampIdEnd=LampCount-1) with
         LampUpdateComplete=1 to apply immediately.
-        """
-        # Disable autonomous mode so device accepts our color
-        self.set_autonomous(False)
 
-        # Get lamp count for the range
+        Opens the fd once for the entire sequence (autonomous + attrs + update).
+        """
+        range_info = self._require_report("range_update")
+
+        with self:
+            self.set_autonomous(False)
+
+            try:
+                attrs = self.get_attributes()
+                lamp_end = max(0, attrs.lamp_count - 1)
+            except OSError as exc:
+                warnings.warn(
+                    f"Could not read lamp count, defaulting to 0: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                lamp_end = 0
+
+            # LampRangeUpdateReport layout (Section 26.4):
+            # [ReportID, Flags(8), IdStart(16), IdEnd(16), R(8), G(8), B(8), I(8)]
+            buf = bytearray(range_info.size + 1)
+            struct.pack_into(
+                "<BBHHBBBB",
+                buf,
+                0,
+                range_info.report_id,
+                0x01,  # LampUpdateFlags: bit 0 = LampUpdateComplete
+                0,  # LampIdStart
+                lamp_end,  # LampIdEnd
+                r & 0xFF,
+                g & 0xFF,
+                b & 0xFF,
+                intensity & 0xFF,
+            )
+            self._feat_set(buf)
+
+    def summary(self) -> str:
+        """One-line summary for CLI listing."""
         try:
             attrs = self.get_attributes()
-            lamp_end = max(0, attrs.lamp_count - 1)
-        except Exception:
-            lamp_end = 0
-
-        range_info = self._reports.get("range_update")
-        if range_info is None:
-            raise RuntimeError("Device has no LampRangeUpdateReport")
-
-        # LampRangeUpdateReport layout (Section 26.4):
-        # [ReportID, Flags(8), IdStart(16), IdEnd(16), R(8), G(8), B(8), I(8)]
-        buf = bytearray(range_info.size + 1)
-        buf[0] = range_info.report_id
-        buf[1] = 0x01  # LampUpdateFlags: bit 0 = LampUpdateComplete
-        struct.pack_into("<H", buf, 2, 0)  # LampIdStart = 0
-        struct.pack_into("<H", buf, 4, lamp_end)  # LampIdEnd
-        buf[6] = r & 0xFF
-        buf[7] = g & 0xFF
-        buf[8] = b & 0xFF
-        buf[9] = intensity & 0xFF
-        self._feat_set(buf)
+            return f"LampArray  {attrs.lamp_count} lamp(s), {attrs.kind_name}"
+        except OSError:
+            return "LampArray"
 
 
-@dataclass
-class LedRgbAttributes:
-    """LED Page RGB device attributes (Section 11.7)."""
-
-    name: str
-    path: str
-    protocol: str
-    report_id: int
-    channel_size: int
-    has_intensity: bool
-
-
-class LedRgbDevice:
+class LedRgbDevice(_HidDevice):
     """HID LED Page RGB LED (Usage Page 0x08, Section 11.7) control.
 
     Uses the RGB LED collection (Usage 0x52) with individual channel controls:
@@ -248,11 +298,6 @@ class LedRgbDevice:
 
     Byte offsets are determined by descriptor parsing, not assumed.
     """
-
-    def __init__(self, info: LedRgbInfo):
-        self.info = info
-        self.path = info.hidraw_path
-        self.name = info.name
 
     def set_color(self, r: int, g: int, b: int, intensity: int = 255) -> None:
         """Set RGB LED color via Feature report.
@@ -269,9 +314,7 @@ class LedRgbDevice:
         buf[1 + info.green_offset] = g & 0xFF
         if info.intensity_offset is not None:
             buf[1 + info.intensity_offset] = intensity & 0xFF
-
-        with open(self.path, "r+b", buffering=0) as f:
-            fcntl.ioctl(f, HIDIOCSFEATURE(len(buf)), buf)
+        self._feat_set(buf)
 
     def get_attributes(self) -> LedRgbAttributes:
         """Return basic device info (LED Page has no LampArray-style attributes)."""
@@ -284,9 +327,6 @@ class LedRgbDevice:
             has_intensity=self.info.intensity_offset is not None,
         )
 
-    def set_autonomous(self, enabled: bool) -> None:
-        """Not supported on LED Page 0x08 — no AutonomousMode concept."""
-        raise NotImplementedError(
-            "LED Page (0x08) does not support autonomous mode. "
-            "This feature is only available on LampArray (Usage Page 0x59) devices."
-        )
+    def summary(self) -> str:
+        """One-line summary for CLI listing."""
+        return "LED RGB"
