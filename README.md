@@ -79,6 +79,9 @@ hid-rgb-ctl auto off    # host takes control
 hid-rgb-ctl auto on     # device resumes built-in effects
 ```
 
+Color presets: `red`, `green`, `blue`, `white`, `cyan`, `yellow`, `orange`,
+`purple`, `pink`, `off`
+
 ## Permissions
 
 HID device access requires read/write permission on `/dev/hidrawN`.
@@ -155,6 +158,42 @@ loops), callers should wait at least this long between updates. The spec
 requires the host to not send more than one `LampUpdateComplete` per interval.
 Since each CLI invocation is a separate process, this cannot be enforced
 automatically — scripts should add appropriate delays between calls.
+
+## Examples
+
+See [`examples/`](examples/) for scripts that use `hid-rgb-ctl` for lighting
+effects, including `rainbow.sh` (smooth rainbow gradient loop). When writing
+animation loops, respect the device's `MinUpdateIntervalInMicroseconds`
+(see [MinUpdateInterval](#minupdateinterval) above).
+
+## Library Usage
+
+This crate can also be used as a Rust library:
+
+```rust
+use hid_rgb_ctl::{discover_devices, DeviceInfo, LampArrayDevice, LedRgbDevice};
+
+let devices = discover_devices();
+for dev in &devices {
+    match dev {
+        DeviceInfo::LampArray(info) => {
+            let device = LampArrayDevice::new(info);
+            device.set_color(255, 0, 0, 255).unwrap();
+        }
+        DeviceInfo::LedRgb(info) => {
+            let device = LedRgbDevice::new(info);
+            device.set_color(255, 0, 0, 255).unwrap();
+        }
+    }
+}
+```
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+hid-rgb-ctl = { git = "https://github.com/xz-dev/hid-rgb-ctl.git" }
+```
 
 ## References
 
