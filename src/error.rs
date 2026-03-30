@@ -12,6 +12,12 @@ pub enum Error {
     PermissionDenied { path: String },
     /// A required HID report type is missing from the device descriptor.
     MissingReport { report_name: String },
+    /// LampAttributesResponseReport returned an unexpected LampId.
+    LampIdMismatch { expected: u16, got: u16 },
+    /// Caller specified a LampId that exceeds the device's LampCount.
+    LampIdOutOfRange { lamp_id: u16, lamp_count: u16 },
+    /// Caller specified the same LampId in multiple update slots.
+    DuplicateLampId { lamp_id: u16 },
     /// The `auto` command was used on a non-LampArray device.
     NoAutonomousMode,
     /// The `set-lamp` command was used on a non-LampArray device.
@@ -32,6 +38,21 @@ impl fmt::Display for Error {
             }
             Self::MissingReport { report_name } => {
                 write!(f, "Device has no '{report_name}' report")
+            }
+            Self::LampIdMismatch { expected, got } => {
+                write!(
+                    f,
+                    "LampAttributesResponse returned LampId {got}, expected {expected}"
+                )
+            }
+            Self::LampIdOutOfRange {
+                lamp_id,
+                lamp_count,
+            } => {
+                write!(f, "LampId {lamp_id} exceeds device LampCount {lamp_count}")
+            }
+            Self::DuplicateLampId { lamp_id } => {
+                write!(f, "Duplicate LampId {lamp_id} in update request")
             }
             Self::NoAutonomousMode => {
                 write!(

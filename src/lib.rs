@@ -32,5 +32,5 @@ pub mod device;
 pub mod error;
 
 pub use descriptor::{discover_devices, DeviceInfo, LampArrayInfo, LedRgbInfo, ReportType};
-pub use device::{LampArrayDevice, LedRgbDevice};
+pub use device::{LampArrayAttributes, LampArrayDevice, LampAttributes, LedRgbDevice};
 pub use error::Error;

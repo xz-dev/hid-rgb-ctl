@@ -122,32 +122,25 @@ fn cmd_get(info: &DeviceInfo) {
                     );
                     println!("Min update interval: {} us", attrs.min_update_interval_us);
 
-                    for (i, result) in lamps.iter().enumerate() {
-                        match result {
-                            Ok(lamp) => {
-                                println!("\nLamp {}:", lamp.lamp_id);
-                                println!(
-                                    "  Position: ({:.1}, {:.1}, {:.1}) mm",
-                                    lamp.position_x_um as f64 / 1000.0,
-                                    lamp.position_y_um as f64 / 1000.0,
-                                    lamp.position_z_um as f64 / 1000.0
-                                );
-                                println!(
-                                    "  RGB levels: {}/{}/{}",
-                                    lamp.red_level_count,
-                                    lamp.green_level_count,
-                                    lamp.blue_level_count
-                                );
-                                println!("  Intensity levels: {}", lamp.intensity_level_count);
-                                println!(
-                                    "  Programmable: {}",
-                                    if lamp.is_programmable { "yes" } else { "no" }
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("Error reading lamp {i}: {e}");
-                            }
-                        }
+                    for lamp in &lamps {
+                        println!("\nLamp {}:", lamp.lamp_id);
+                        println!(
+                            "  Position: ({:.1}, {:.1}, {:.1}) mm",
+                            lamp.position_x_um as f64 / 1000.0,
+                            lamp.position_y_um as f64 / 1000.0,
+                            lamp.position_z_um as f64 / 1000.0
+                        );
+                        println!(
+                            "  RGB levels: {}/{}/{}",
+                            lamp.red_level_count,
+                            lamp.green_level_count,
+                            lamp.blue_level_count
+                        );
+                        println!("  Intensity levels: {}", lamp.intensity_level_count);
+                        println!(
+                            "  Programmable: {}",
+                            if lamp.is_programmable { "yes" } else { "no" }
+                        );
                     }
                 }
                 Err(e) => {

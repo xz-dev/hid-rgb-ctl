@@ -4,7 +4,7 @@
 //! - [`LampArrayDevice`]: HID LampArray (Usage Page 0x59) per HUT v1.4 Section 26
 //! - [`LedRgbDevice`]: LED Page RGB LED (Usage Page 0x08) per HUT v1.4 Section 11.7
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 
@@ -163,6 +163,39 @@ fn require_report<'a>(
     })
 }
 
+// --- Lamp response parser ---
+
+/// Parse a LampAttributesResponseReport buffer into [`LampAttributes`].
+///
+/// Layout (Section 26.3, verified against Microsoft reference
+/// `LampArrayReportDescriptor.h` Report 3):
+///   `[ReportID, LampId(16), PosX(32), PosY(32), PosZ(32),
+///    Latency(32), Purposes(32), RedCount(8), GreenCount(8),
+///    BlueCount(8), IntensityCount(8), IsProgrammable(8), InputBinding(8)]`
+fn parse_lamp_response(buf: &[u8]) -> LampAttributes {
+    let lamp_id = u16::from_le_bytes([buf[1], buf[2]]);
+    let pos_x = u32::from_le_bytes([buf[3], buf[4], buf[5], buf[6]]);
+    let pos_y = u32::from_le_bytes([buf[7], buf[8], buf[9], buf[10]]);
+    let pos_z = u32::from_le_bytes([buf[11], buf[12], buf[13], buf[14]]);
+    let latency = u32::from_le_bytes([buf[15], buf[16], buf[17], buf[18]]);
+    let purposes = u32::from_le_bytes([buf[19], buf[20], buf[21], buf[22]]);
+
+    LampAttributes {
+        lamp_id,
+        position_x_um: pos_x,
+        position_y_um: pos_y,
+        position_z_um: pos_z,
+        update_latency_us: latency,
+        lamp_purposes: purposes,
+        red_level_count: buf[23],
+        green_level_count: buf[24],
+        blue_level_count: buf[25],
+        intensity_level_count: buf[26],
+        is_programmable: buf[27] != 0,
+        input_binding: buf[28],
+    }
+}
+
 // --- LampArrayDevice ---
 
 /// HID LampArray (Usage Page 0x59) control.
@@ -243,53 +276,74 @@ impl<'a> LampArrayDevice<'a> {
 
         let resp_info = require_report(&self.info.reports, "attr_response")?;
         let buf = fd.feat_get(resp_info.report_id, resp_info.size)?;
+        let lamp = parse_lamp_response(&buf);
 
-        // Layout: [ReportID, LampId(16), PosX(32), PosY(32), PosZ(32),
-        //          Latency(32), Purposes(32), RedCount(8), GreenCount(8),
-        //          BlueCount(8), IntensityCount(8), IsProgrammable(8),
-        //          InputBinding(8)]
-        let lamp_id = u16::from_le_bytes([buf[1], buf[2]]);
-        let pos_x = u32::from_le_bytes([buf[3], buf[4], buf[5], buf[6]]);
-        let pos_y = u32::from_le_bytes([buf[7], buf[8], buf[9], buf[10]]);
-        let pos_z = u32::from_le_bytes([buf[11], buf[12], buf[13], buf[14]]);
-        let latency = u32::from_le_bytes([buf[15], buf[16], buf[17], buf[18]]);
-        let purposes = u32::from_le_bytes([buf[19], buf[20], buf[21], buf[22]]);
-        let r_cnt = buf[23];
-        let g_cnt = buf[24];
-        let b_cnt = buf[25];
-        let i_cnt = buf[26];
-        let prog = buf[27];
-        let binding = buf[28];
+        // Per Section 26.8.2: "The Host must always check the LampId of
+        // the returned report to ensure it was expected."
+        if lamp.lamp_id != index {
+            return Err(Error::LampIdMismatch {
+                expected: index,
+                got: lamp.lamp_id,
+            });
+        }
 
-        Ok(LampAttributes {
-            lamp_id,
-            position_x_um: pos_x,
-            position_y_um: pos_y,
-            position_z_um: pos_z,
-            update_latency_us: latency,
-            lamp_purposes: purposes,
-            red_level_count: r_cnt,
-            green_level_count: g_cnt,
-            blue_level_count: b_cnt,
-            intensity_level_count: i_cnt,
-            is_programmable: prog != 0,
-            input_binding: binding,
-        })
+        Ok(lamp)
+    }
+
+    /// Read all lamp attributes using the auto-increment mechanism (Section 26.8.2).
+    ///
+    /// Sends a single `LampAttributesRequestReport` for LampId=0, then reads
+    /// `lamp_count` consecutive `LampAttributesResponseReport`s. The device
+    /// auto-increments its internal LampId after each successful response,
+    /// reducing the number of ioctl calls from 2N to N+1.
+    ///
+    /// Each response's LampId is validated against the expected sequence.
+    fn read_all_lamps_with_fd(
+        &self,
+        fd: &HidrawFd,
+        lamp_count: u16,
+    ) -> Result<Vec<LampAttributes>> {
+        if lamp_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Send request for lamp 0 (sets device internal counter).
+        let req_info = require_report(&self.info.reports, "attr_request")?;
+        let mut req_buf = vec![0u8; req_info.size + 1];
+        req_buf[0] = req_info.report_id;
+        // LampId = 0 (already zeroed)
+        fd.feat_set(&mut req_buf)?;
+
+        // Read lamp_count responses; device auto-increments after each.
+        let resp_info = require_report(&self.info.reports, "attr_response")?;
+        let mut lamps = Vec::with_capacity(lamp_count as usize);
+
+        for expected_id in 0..lamp_count {
+            let buf = fd.feat_get(resp_info.report_id, resp_info.size)?;
+            let lamp = parse_lamp_response(&buf);
+            if lamp.lamp_id != expected_id {
+                return Err(Error::LampIdMismatch {
+                    expected: expected_id,
+                    got: lamp.lamp_id,
+                });
+            }
+            lamps.push(lamp);
+        }
+
+        Ok(lamps)
     }
 
     /// Read attributes and all lamp info using a single fd.
     ///
-    /// More efficient than calling `get_attributes()` + `get_lamp()` in a loop,
-    /// which opens a new fd for each call.
+    /// Uses the auto-increment mechanism (Section 26.8.2) to read all
+    /// lamp attributes efficiently with a single request followed by
+    /// sequential responses.
     pub fn get_attributes_and_lamps(
         &self,
-    ) -> Result<(LampArrayAttributes, Vec<Result<LampAttributes>>)> {
+    ) -> Result<(LampArrayAttributes, Vec<LampAttributes>)> {
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
         let attrs = self.get_attributes_with_fd(&fd)?;
-        let mut lamps = Vec::with_capacity(attrs.lamp_count as usize);
-        for i in 0..attrs.lamp_count {
-            lamps.push(self.get_lamp_with_fd(&fd, i));
-        }
+        let lamps = self.read_all_lamps_with_fd(&fd, attrs.lamp_count)?;
         Ok((attrs, lamps))
     }
 
@@ -313,11 +367,16 @@ impl<'a> LampArrayDevice<'a> {
 
     /// Set all lamps to a uniform color.
     ///
-    /// Disables autonomous mode, then sends a LampRangeUpdate covering
-    /// all lamps (LampIdStart=0, LampIdEnd=LampCount-1) with
-    /// LampUpdateComplete=1 to apply immediately.
+    /// Disables autonomous mode, reads all lamp attributes, scales the
+    /// RGBI values to the device's LevelCounts (Section 26.9), then sends
+    /// a LampRangeUpdate covering all lamps with LampUpdateComplete=1.
     ///
-    /// Opens the fd once for the entire sequence (autonomous + attrs + update).
+    /// RGB values are scaled to the minimum LevelCount across all
+    /// *Programmable* lamps in the range (FixedColor lamps' RGB channels
+    /// are ignored by the device per Section 26.11.2). Intensity is scaled
+    /// to the minimum IntensityLevelCount across *all* lamps.
+    ///
+    /// Opens the fd once for the entire sequence.
     ///
     /// Note: Callers performing rapid sequential updates should respect
     /// the device's `min_update_interval_us` (from [`get_attributes()`])
@@ -331,21 +390,38 @@ impl<'a> LampArrayDevice<'a> {
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
         self.set_autonomous_with_fd(&fd, false)?;
 
-        let lamp_end = match self.get_attributes_with_fd(&fd) {
-            Ok(attrs) => {
-                if attrs.lamp_count > 0 {
-                    attrs.lamp_count - 1
-                } else {
-                    0
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: Could not read lamp count, defaulting to 0: {e}");
-                0
-            }
+        let attrs = self.get_attributes_with_fd(&fd)?;
+        let lamp_end = if attrs.lamp_count > 0 {
+            attrs.lamp_count - 1
+        } else {
+            0
         };
 
-        // LampRangeUpdateReport layout (Section 26.4):
+        // Read all lamp attributes for LevelCount scaling.
+        let lamps = self.read_all_lamps_with_fd(&fd, attrs.lamp_count)?;
+
+        // Compute scaling limits.
+        // RGB: min LevelCount across Programmable lamps only (Section 26.11.2:
+        //   "For FixedColor Lamps, Red/Green/Blue channels are always ignored.")
+        // Intensity: min across all lamps (FixedColor lamps support intensity).
+        let (max_r, max_g, max_b) = lamps
+            .iter()
+            .filter(|l| l.is_programmable)
+            .fold((255u32, 255u32, 255u32), |(mr, mg, mb), l| {
+                (
+                    mr.min(l.red_level_count as u32),
+                    mg.min(l.green_level_count as u32),
+                    mb.min(l.blue_level_count as u32),
+                )
+            });
+        let max_i = lamps
+            .iter()
+            .map(|l| l.intensity_level_count as u32)
+            .min()
+            .unwrap_or(255);
+
+        // LampRangeUpdateReport layout (Section 26.11.2, verified against
+        // Microsoft reference Report 5):
         // [ReportID, Flags(8), IdStart(16), IdEnd(16), R(8), G(8), B(8), I(8)]
         let mut buf = vec![0u8; range_size + 1];
         buf[0] = range_report_id;
@@ -356,10 +432,10 @@ impl<'a> LampArrayDevice<'a> {
         let end_bytes = lamp_end.to_le_bytes();
         buf[4] = end_bytes[0];
         buf[5] = end_bytes[1];
-        buf[6] = r;
-        buf[7] = g;
-        buf[8] = b;
-        buf[9] = intensity;
+        buf[6] = scale_u8(r, max_r);
+        buf[7] = scale_u8(g, max_g);
+        buf[8] = scale_u8(b, max_b);
+        buf[9] = scale_u8(intensity, max_i);
 
         fd.feat_set(&mut buf)
     }
@@ -367,10 +443,18 @@ impl<'a> LampArrayDevice<'a> {
     /// Set individual lamp colors using LampMultiUpdateReport (Section 26.11.1).
     ///
     /// Each entry is `(lamp_id, red, green, blue, intensity)`.
-    /// Colors are batched into LampMultiUpdateReports based on the device's
-    /// slot count (derived from report size). Intermediate batches set
-    /// LampUpdateComplete=0; the final batch sets LampUpdateComplete=1
-    /// so the device applies all updates atomically.
+    ///
+    /// Before sending, this method:
+    /// - Validates all LampIds are within the device's LampCount range
+    ///   (Section 26.11.1: "Any LampId >= Device LampCount" is an error)
+    /// - Rejects duplicate LampIds within a single call
+    ///   (Section 26.11.1: "Identical LampId in multiple slots" is an error)
+    /// - Scales RGBI values to each lamp's declared LevelCounts (Section 26.9)
+    /// - Zeros RGB channels for FixedColor lamps (Section 26.11.1 best practice)
+    ///
+    /// Colors are batched into reports based on the device's slot count.
+    /// Intermediate batches set LampUpdateComplete=0; the final batch sets
+    /// LampUpdateComplete=1 so the device applies all updates atomically.
     ///
     /// Requires the device descriptor to include a `multi_update` report.
     ///
@@ -399,9 +483,60 @@ impl<'a> LampArrayDevice<'a> {
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
         self.set_autonomous_with_fd(&fd, false)?;
 
-        let total_chunks = colors.chunks(slot_count).count();
+        // Read device attributes and all lamp attributes for validation + scaling.
+        let attrs = self.get_attributes_with_fd(&fd)?;
+        let lamps = self.read_all_lamps_with_fd(&fd, attrs.lamp_count)?;
 
-        for (chunk_idx, chunk) in colors.chunks(slot_count).enumerate() {
+        // Validate: all LampIds must be < LampCount (Section 26.11.1).
+        for &(lamp_id, _, _, _, _) in colors {
+            if lamp_id >= attrs.lamp_count {
+                return Err(Error::LampIdOutOfRange {
+                    lamp_id,
+                    lamp_count: attrs.lamp_count,
+                });
+            }
+        }
+
+        // Validate: no duplicate LampIds (Section 26.11.1).
+        let mut seen = HashSet::with_capacity(colors.len());
+        for &(lamp_id, _, _, _, _) in colors {
+            if !seen.insert(lamp_id) {
+                return Err(Error::DuplicateLampId { lamp_id });
+            }
+        }
+
+        // Pre-compute scaled colors per lamp.
+        // Programmable lamps: scale RGBI to individual LevelCounts.
+        // FixedColor lamps: set RGB to 0, scale Intensity only (Section 26.11.1).
+        let scaled: Vec<(u16, u8, u8, u8, u8)> = colors
+            .iter()
+            .map(|&(id, r, g, b, intensity)| {
+                let lamp = &lamps[id as usize];
+                if lamp.is_programmable {
+                    (
+                        id,
+                        scale_u8(r, lamp.red_level_count as u32),
+                        scale_u8(g, lamp.green_level_count as u32),
+                        scale_u8(b, lamp.blue_level_count as u32),
+                        scale_u8(intensity, lamp.intensity_level_count as u32),
+                    )
+                } else {
+                    // FixedColor: "as a best practice these channels should
+                    // always be set to 0 by the Host" (Section 26.11.1)
+                    (
+                        id,
+                        0,
+                        0,
+                        0,
+                        scale_u8(intensity, lamp.intensity_level_count as u32),
+                    )
+                }
+            })
+            .collect();
+
+        let total_chunks = scaled.chunks(slot_count).count();
+
+        for (chunk_idx, chunk) in scaled.chunks(slot_count).enumerate() {
             let is_last = chunk_idx == total_chunks - 1;
             let mut buf = vec![0u8; multi_size + 1];
             buf[0] = multi_report_id;
