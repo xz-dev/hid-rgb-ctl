@@ -4,7 +4,7 @@
 //! - [`LampArrayDevice`]: HID LampArray (Usage Page 0x59) per HUT v1.4 Section 26
 //! - [`LedRgbDevice`]: LED Page RGB LED (Usage Page 0x08) per HUT v1.4 Section 11.7
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 
@@ -77,6 +77,16 @@ pub struct LampAttributes {
     pub input_binding: u8,
 }
 
+/// Per-lamp color specification for [`LampArrayDevice::set_lamp_colors`].
+#[derive(Debug, Clone, Copy)]
+pub struct LampColor {
+    pub lamp_id: u16,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub intensity: u8,
+}
+
 /// LampArray device attributes (Section 26.2).
 #[derive(Debug, Clone)]
 pub struct LampArrayAttributes {
@@ -86,7 +96,7 @@ pub struct LampArrayAttributes {
     pub height_um: u32,
     pub depth_um: u32,
     pub kind: u32,
-    pub kind_name: String,
+    pub kind_name: &'static str,
     pub min_update_interval_us: u32,
 }
 
@@ -95,7 +105,7 @@ pub struct LampArrayAttributes {
 pub struct LedRgbAttributes {
     pub name: String,
     pub path: String,
-    pub protocol: String,
+    pub protocol: &'static str,
     pub report_id: u8,
     pub channel_size: u32,
     pub has_intensity: bool,
@@ -110,7 +120,19 @@ struct HidrawFd {
 
 impl HidrawFd {
     fn open(path: &str) -> Result<Self> {
-        let fd = OpenOptions::new().read(true).write(true).open(path)?;
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::PermissionDenied => Error::PermissionDenied {
+                    path: path.to_string(),
+                },
+                std::io::ErrorKind::NotFound => Error::DeviceNotFound {
+                    path: path.to_string(),
+                },
+                _ => Error::Io(e),
+            })?;
         Ok(Self { fd })
     }
 
@@ -133,7 +155,7 @@ impl HidrawFd {
     }
 
     /// Write a HID Feature report (HIDIOCSFEATURE).
-    fn feat_set(&self, buf: &mut [u8]) -> Result<()> {
+    fn feat_set(&self, buf: &[u8]) -> Result<()> {
         let ret =
             unsafe { libc::ioctl(self.fd.as_raw_fd(), hidiocsfeature(buf.len()), buf.as_ptr()) };
         if ret < 0 {
@@ -155,11 +177,8 @@ impl HidrawFd {
 
 // --- Helper to require a report ---
 
-fn require_report<'a>(
-    reports: &'a HashMap<String, ReportInfo>,
-    name: &str,
-) -> Result<&'a ReportInfo> {
-    reports.get(name).ok_or_else(|| Error::MissingReport {
+fn require_report<'a>(report: &'a Option<ReportInfo>, name: &str) -> Result<&'a ReportInfo> {
+    report.as_ref().ok_or_else(|| Error::MissingReport {
         report_name: name.to_string(),
     })
 }
@@ -173,7 +192,17 @@ fn require_report<'a>(
 ///   `[ReportID, LampId(16), PosX(32), PosY(32), PosZ(32),
 ///    Latency(32), Purposes(32), RedCount(8), GreenCount(8),
 ///    BlueCount(8), IntensityCount(8), IsProgrammable(8), InputBinding(8)]`
-fn parse_lamp_response(buf: &[u8]) -> LampAttributes {
+fn parse_lamp_response(buf: &[u8]) -> Result<LampAttributes> {
+    // Minimum size: ReportId(1) + LampId(2) + Pos(12) + Latency(4) + Purposes(4)
+    //               + RGBI counts(4) + IsProgrammable(1) + InputBinding(1) = 29 bytes
+    // Verified against Microsoft reference LampAttributesResponseReport struct.
+    if buf.len() < 29 {
+        return Err(Error::TruncatedReport {
+            report_name: "LampAttributesResponse",
+            expected: 29,
+            got: buf.len(),
+        });
+    }
     let lamp_id = u16::from_le_bytes([buf[1], buf[2]]);
     let pos_x = u32::from_le_bytes([buf[3], buf[4], buf[5], buf[6]]);
     let pos_y = u32::from_le_bytes([buf[7], buf[8], buf[9], buf[10]]);
@@ -181,7 +210,7 @@ fn parse_lamp_response(buf: &[u8]) -> LampAttributes {
     let latency = u32::from_le_bytes([buf[15], buf[16], buf[17], buf[18]]);
     let purposes = u32::from_le_bytes([buf[19], buf[20], buf[21], buf[22]]);
 
-    LampAttributes {
+    Ok(LampAttributes {
         lamp_id,
         position_x_um: pos_x,
         position_y_um: pos_y,
@@ -194,7 +223,7 @@ fn parse_lamp_response(buf: &[u8]) -> LampAttributes {
         intensity_level_count: buf[26],
         is_programmable: buf[27] != 0,
         input_binding: buf[28],
-    }
+    })
 }
 
 // --- LampArrayDevice ---
@@ -234,8 +263,18 @@ impl<'a> LampArrayDevice<'a> {
     }
 
     fn get_attributes_with_fd(&self, fd: &HidrawFd) -> Result<LampArrayAttributes> {
-        let rinfo = require_report(&self.info.reports, "attributes")?;
+        let rinfo = require_report(&self.info.reports.attributes, "attributes")?;
         let buf = fd.feat_get(rinfo.report_id, rinfo.size)?;
+
+        // Minimum size: ReportId(1) + LampCount(2) + 5×u32(20) = 23 bytes
+        // Verified against Microsoft reference LampArrayAttributesReport struct.
+        if buf.len() < 23 {
+            return Err(Error::TruncatedReport {
+                report_name: "LampArrayAttributes",
+                expected: 23,
+                got: buf.len(),
+            });
+        }
 
         // Layout: [ReportID, LampCount(16), Width(32), Height(32),
         //          Depth(32), Kind(32), MinInterval(32)]
@@ -252,7 +291,7 @@ impl<'a> LampArrayDevice<'a> {
             height_um: height,
             depth_um: depth,
             kind,
-            kind_name: lamp_array_kind_name(kind).to_string(),
+            kind_name: lamp_array_kind_name(kind),
             min_update_interval_us: interval,
         })
     }
@@ -267,17 +306,17 @@ impl<'a> LampArrayDevice<'a> {
     }
 
     fn get_lamp_with_fd(&self, fd: &HidrawFd, index: u16) -> Result<LampAttributes> {
-        let req_info = require_report(&self.info.reports, "attr_request")?;
+        let req_info = require_report(&self.info.reports.attr_request, "attr_request")?;
         let mut req_buf = vec![0u8; req_info.size + 1];
         req_buf[0] = req_info.report_id;
         let idx_bytes = index.to_le_bytes();
         req_buf[1] = idx_bytes[0];
         req_buf[2] = idx_bytes[1];
-        fd.feat_set(&mut req_buf)?;
+        fd.feat_set(&req_buf)?;
 
-        let resp_info = require_report(&self.info.reports, "attr_response")?;
+        let resp_info = require_report(&self.info.reports.attr_response, "attr_response")?;
         let buf = fd.feat_get(resp_info.report_id, resp_info.size)?;
-        let lamp = parse_lamp_response(&buf);
+        let lamp = parse_lamp_response(&buf)?;
 
         // Per Section 26.8.2: "The Host must always check the LampId of
         // the returned report to ensure it was expected."
@@ -309,19 +348,19 @@ impl<'a> LampArrayDevice<'a> {
         }
 
         // Send request for lamp 0 (sets device internal counter).
-        let req_info = require_report(&self.info.reports, "attr_request")?;
+        let req_info = require_report(&self.info.reports.attr_request, "attr_request")?;
         let mut req_buf = vec![0u8; req_info.size + 1];
         req_buf[0] = req_info.report_id;
         // LampId = 0 (already zeroed)
-        fd.feat_set(&mut req_buf)?;
+        fd.feat_set(&req_buf)?;
 
         // Read lamp_count responses; device auto-increments after each.
-        let resp_info = require_report(&self.info.reports, "attr_response")?;
+        let resp_info = require_report(&self.info.reports.attr_response, "attr_response")?;
         let mut lamps = Vec::with_capacity(lamp_count as usize);
 
         for expected_id in 0..lamp_count {
             let buf = fd.feat_get(resp_info.report_id, resp_info.size)?;
-            let lamp = parse_lamp_response(&buf);
+            let lamp = parse_lamp_response(&buf)?;
             if lamp.lamp_id != expected_id {
                 return Err(Error::LampIdMismatch {
                     expected: expected_id,
@@ -357,25 +396,25 @@ impl<'a> LampArrayDevice<'a> {
     }
 
     fn set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
-        let ctrl_info = require_report(&self.info.reports, "control")?;
+        let ctrl_info = require_report(&self.info.reports.control, "control")?;
         let mut buf = vec![0u8; ctrl_info.size + 1];
         buf[0] = ctrl_info.report_id;
         buf[1] = if enabled { 0x01 } else { 0x00 };
-        fd.feat_set(&mut buf)
+        fd.feat_set(&buf)
     }
 
     /// Try to set AutonomousMode; silently succeeds if the device has
     /// no LampArrayControlReport (Section 26.10.1: "If this field is
     /// absent, it means no autonomous mode is supported.").
     fn try_set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
-        let ctrl_info = match self.info.reports.get("control") {
+        let ctrl_info = match &self.info.reports.control {
             Some(info) => info,
             None => return Ok(()),
         };
         let mut buf = vec![0u8; ctrl_info.size + 1];
         buf[0] = ctrl_info.report_id;
         buf[1] = if enabled { 0x01 } else { 0x00 };
-        fd.feat_set(&mut buf)
+        fd.feat_set(&buf)
     }
 
     /// Set all lamps to a uniform color.
@@ -396,7 +435,7 @@ impl<'a> LampArrayDevice<'a> {
     /// between calls. Per Section 26.11, the spec requires no more than
     /// one LampUpdateComplete per MinUpdateIntervalInMicroseconds.
     pub fn set_color(&self, r: u8, g: u8, b: u8, intensity: u8) -> Result<()> {
-        let range_info = require_report(&self.info.reports, "range_update")?;
+        let range_info = require_report(&self.info.reports.range_update, "range_update")?;
         let range_report_id = range_info.report_id;
         let range_size = range_info.size;
 
@@ -449,7 +488,7 @@ impl<'a> LampArrayDevice<'a> {
         buf[8] = scale_u8(b, max_b);
         buf[9] = scale_u8(intensity, max_i);
 
-        fd.feat_set(&mut buf)
+        fd.feat_set(&buf)
     }
 
     /// Set individual lamp colors using LampMultiUpdateReport (Section 26.11.1).
@@ -474,12 +513,12 @@ impl<'a> LampArrayDevice<'a> {
     /// the device's `min_update_interval_us` (from [`get_attributes()`])
     /// between calls. Per Section 26.11, the spec requires no more than
     /// one LampUpdateComplete per MinUpdateIntervalInMicroseconds.
-    pub fn set_lamp_colors(&self, colors: &[(u16, u8, u8, u8, u8)]) -> Result<()> {
+    pub fn set_lamp_colors(&self, colors: &[LampColor]) -> Result<()> {
         if colors.is_empty() {
             return Ok(());
         }
 
-        let multi_info = require_report(&self.info.reports, "multi_update")?;
+        let multi_info = require_report(&self.info.reports.multi_update, "multi_update")?;
         let multi_report_id = multi_info.report_id;
         let multi_size = multi_info.size;
 
@@ -500,10 +539,10 @@ impl<'a> LampArrayDevice<'a> {
         let lamps = self.read_all_lamps_with_fd(&fd, attrs.lamp_count)?;
 
         // Validate: all LampIds must be < LampCount (Section 26.11.1).
-        for &(lamp_id, _, _, _, _) in colors {
-            if lamp_id >= attrs.lamp_count {
+        for c in colors {
+            if c.lamp_id >= attrs.lamp_count {
                 return Err(Error::LampIdOutOfRange {
-                    lamp_id,
+                    lamp_id: c.lamp_id,
                     lamp_count: attrs.lamp_count,
                 });
             }
@@ -511,42 +550,42 @@ impl<'a> LampArrayDevice<'a> {
 
         // Validate: no duplicate LampIds (Section 26.11.1).
         let mut seen = HashSet::with_capacity(colors.len());
-        for &(lamp_id, _, _, _, _) in colors {
-            if !seen.insert(lamp_id) {
-                return Err(Error::DuplicateLampId { lamp_id });
+        for c in colors {
+            if !seen.insert(c.lamp_id) {
+                return Err(Error::DuplicateLampId { lamp_id: c.lamp_id });
             }
         }
 
         // Pre-compute scaled colors per lamp.
         // Programmable lamps: scale RGBI to individual LevelCounts.
         // FixedColor lamps: set RGB to 0, scale Intensity only (Section 26.11.1).
-        let scaled: Vec<(u16, u8, u8, u8, u8)> = colors
+        let scaled: Vec<LampColor> = colors
             .iter()
-            .map(|&(id, r, g, b, intensity)| {
-                let lamp = &lamps[id as usize];
+            .map(|c| {
+                let lamp = &lamps[c.lamp_id as usize];
                 if lamp.is_programmable {
-                    (
-                        id,
-                        scale_u8(r, lamp.red_level_count as u32),
-                        scale_u8(g, lamp.green_level_count as u32),
-                        scale_u8(b, lamp.blue_level_count as u32),
-                        scale_u8(intensity, lamp.intensity_level_count as u32),
-                    )
+                    LampColor {
+                        lamp_id: c.lamp_id,
+                        red: scale_u8(c.red, lamp.red_level_count as u32),
+                        green: scale_u8(c.green, lamp.green_level_count as u32),
+                        blue: scale_u8(c.blue, lamp.blue_level_count as u32),
+                        intensity: scale_u8(c.intensity, lamp.intensity_level_count as u32),
+                    }
                 } else {
                     // FixedColor: "as a best practice these channels should
                     // always be set to 0 by the Host" (Section 26.11.1)
-                    (
-                        id,
-                        0,
-                        0,
-                        0,
-                        scale_u8(intensity, lamp.intensity_level_count as u32),
-                    )
+                    LampColor {
+                        lamp_id: c.lamp_id,
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                        intensity: scale_u8(c.intensity, lamp.intensity_level_count as u32),
+                    }
                 }
             })
             .collect();
 
-        let total_chunks = scaled.chunks(slot_count).count();
+        let total_chunks = scaled.len().div_ceil(slot_count);
 
         for (chunk_idx, chunk) in scaled.chunks(slot_count).enumerate() {
             let is_last = chunk_idx == total_chunks - 1;
@@ -561,37 +600,41 @@ impl<'a> LampArrayDevice<'a> {
 
             // Fill LampIds (16-bit LE each)
             let ids_start = 3;
-            for (j, &(lamp_id, _, _, _, _)) in chunk.iter().enumerate() {
+            for (j, c) in chunk.iter().enumerate() {
                 let off = ids_start + j * 2;
-                let id_bytes = lamp_id.to_le_bytes();
+                let id_bytes = c.lamp_id.to_le_bytes();
                 buf[off] = id_bytes[0];
                 buf[off + 1] = id_bytes[1];
             }
 
             // Fill RGBI tuples (4 bytes each, starting after all LampId slots)
             let rgbi_start = ids_start + slot_count * 2;
-            for (j, &(_, r, g, b, intensity)) in chunk.iter().enumerate() {
+            for (j, c) in chunk.iter().enumerate() {
                 let off = rgbi_start + j * 4;
-                buf[off] = r;
-                buf[off + 1] = g;
-                buf[off + 2] = b;
-                buf[off + 3] = intensity;
+                buf[off] = c.red;
+                buf[off + 1] = c.green;
+                buf[off + 2] = c.blue;
+                buf[off + 3] = c.intensity;
             }
 
-            fd.feat_set(&mut buf)?;
+            fd.feat_set(&buf)?;
         }
 
         Ok(())
     }
 
     /// One-line summary for CLI listing.
-    pub fn summary(&self) -> String {
-        match self.get_attributes() {
-            Ok(attrs) => format!(
-                "LampArray  {} lamp(s), {}",
-                attrs.lamp_count, attrs.kind_name
-            ),
-            Err(_) => "LampArray".to_string(),
+    ///
+    /// Returns a static description based on descriptor info only — does not
+    /// open the device or perform any ioctl calls.
+    pub fn summary(&self) -> &'static str {
+        let has_range = self.info.reports.range_update.is_some();
+        let has_multi = self.info.reports.multi_update.is_some();
+        match (has_range, has_multi) {
+            (true, true) => "LampArray (range+multi update)",
+            (true, false) => "LampArray (range update)",
+            (false, true) => "LampArray (multi update)",
+            (false, false) => "LampArray",
         }
     }
 }
@@ -652,7 +695,7 @@ impl<'a> LedRgbDevice<'a> {
         }
 
         match self.info.report_type {
-            ReportType::Feature => fd.feat_set(&mut buf),
+            ReportType::Feature => fd.feat_set(&buf),
             ReportType::Output => fd.output_set(&buf),
             ReportType::Input => Err(Error::UnsupportedReportType),
         }
@@ -663,7 +706,7 @@ impl<'a> LedRgbDevice<'a> {
         LedRgbAttributes {
             name: self.info.name.clone(),
             path: self.info.hidraw_path.clone(),
-            protocol: "LED Page RGB (Usage Page 0x08, Section 11.7)".to_string(),
+            protocol: "LED Page RGB (Usage Page 0x08, Section 11.7)",
             report_id: self.info.report_id,
             channel_size: self.info.channel_size,
             has_intensity: self.info.intensity_offset.is_some(),
@@ -671,7 +714,7 @@ impl<'a> LedRgbDevice<'a> {
     }
 
     /// One-line summary for CLI listing.
-    pub fn summary(&self) -> String {
-        "LED RGB".to_string()
+    pub fn summary(&self) -> &'static str {
+        "LED RGB"
     }
 }

@@ -10,6 +10,8 @@ use std::fmt;
 pub enum Error {
     /// Permission denied accessing a hidraw device.
     PermissionDenied { path: String },
+    /// The hidraw device path does not exist.
+    DeviceNotFound { path: String },
     /// A required HID report type is missing from the device descriptor.
     MissingReport { report_name: String },
     /// LampAttributesResponseReport returned an unexpected LampId.
@@ -22,6 +24,12 @@ pub enum Error {
     NoAutonomousMode,
     /// The `set-lamp` command was used on a non-LampArray device.
     NoMultiUpdate,
+    /// Device returned a report shorter than expected.
+    TruncatedReport {
+        report_name: &'static str,
+        expected: usize,
+        got: usize,
+    },
     /// Attempted to write to an Input-only report (device-to-host).
     UnsupportedReportType,
     /// Invalid subcommand or argument.
@@ -37,6 +45,9 @@ impl fmt::Display for Error {
         match self {
             Self::PermissionDenied { path } => {
                 write!(f, "Permission denied on {path}")
+            }
+            Self::DeviceNotFound { path } => {
+                write!(f, "Device not found: {path}")
             }
             Self::MissingReport { report_name } => {
                 write!(f, "Device has no '{report_name}' report")
@@ -68,6 +79,16 @@ impl fmt::Display for Error {
                     f,
                     "Per-lamp color control requires a LampArray device (Usage Page 0x59) \
                      with a LampMultiUpdateReport."
+                )
+            }
+            Self::TruncatedReport {
+                report_name,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "Truncated {report_name} report: expected at least {expected} bytes, got {got}"
                 )
             }
             Self::UnsupportedReportType => {

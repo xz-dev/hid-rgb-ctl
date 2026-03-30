@@ -8,7 +8,6 @@
 //!   - Section 26: Lighting and Illumination Page (0x59)
 //!   - Section 11.7: Multicolor (RGB) LED on LED Page (0x08)
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -73,16 +72,29 @@ pub enum ReportType {
     Input,
 }
 
-/// Map from LampArray collection usage to report name.
-fn lamp_array_report_name(usage: u32) -> Option<&'static str> {
-    match usage {
-        USAGE_LAMP_ARRAY_ATTRIBUTES_REPORT => Some("attributes"),
-        USAGE_LAMP_ATTR_REQUEST_REPORT => Some("attr_request"),
-        USAGE_LAMP_ATTR_RESPONSE_REPORT => Some("attr_response"),
-        USAGE_LAMP_MULTI_UPDATE_REPORT => Some("multi_update"),
-        USAGE_LAMP_RANGE_UPDATE_REPORT => Some("range_update"),
-        USAGE_LAMP_ARRAY_CONTROL_REPORT => Some("control"),
-        _ => None,
+/// Identifies which LampArray sub-report collection we are inside.
+#[derive(Debug, Clone, Copy)]
+enum LampArrayReportKind {
+    Attributes,
+    AttrRequest,
+    AttrResponse,
+    MultiUpdate,
+    RangeUpdate,
+    Control,
+}
+
+impl LampArrayReportKind {
+    /// Map from LampArray collection usage to report kind.
+    fn from_usage(usage: u32) -> Option<Self> {
+        match usage {
+            USAGE_LAMP_ARRAY_ATTRIBUTES_REPORT => Some(Self::Attributes),
+            USAGE_LAMP_ATTR_REQUEST_REPORT => Some(Self::AttrRequest),
+            USAGE_LAMP_ATTR_RESPONSE_REPORT => Some(Self::AttrResponse),
+            USAGE_LAMP_MULTI_UPDATE_REPORT => Some(Self::MultiUpdate),
+            USAGE_LAMP_RANGE_UPDATE_REPORT => Some(Self::RangeUpdate),
+            USAGE_LAMP_ARRAY_CONTROL_REPORT => Some(Self::Control),
+            _ => None,
+        }
     }
 }
 
@@ -101,6 +113,20 @@ pub struct ReportInfo {
     pub size: usize,
 }
 
+/// Parsed HID report metadata for all LampArray report types.
+///
+/// Each field corresponds to a specific LampArray report collection.
+/// `None` means the report was not found in the device's descriptor.
+#[derive(Debug, Clone, Default)]
+pub struct LampArrayReports {
+    pub attributes: Option<ReportInfo>,
+    pub attr_request: Option<ReportInfo>,
+    pub attr_response: Option<ReportInfo>,
+    pub multi_update: Option<ReportInfo>,
+    pub range_update: Option<ReportInfo>,
+    pub control: Option<ReportInfo>,
+}
+
 /// Device implementing HID LampArray (Usage Page 0x59).
 ///
 /// Report IDs and sizes are parsed from the device's HID report descriptor,
@@ -109,9 +135,7 @@ pub struct ReportInfo {
 pub struct LampArrayInfo {
     pub hidraw_path: String,
     pub name: String,
-    /// Keys: "attributes", "attr_request", "attr_response",
-    ///        "multi_update", "range_update", "control"
-    pub reports: HashMap<String, ReportInfo>,
+    pub reports: LampArrayReports,
 }
 
 /// Device implementing LED Page RGB LED (Usage Page 0x08, Section 11.7).
@@ -241,23 +265,32 @@ struct ParserState {
     report_count: u32,
     logical_min: i32,
     logical_max: i32,
+    /// Raw unsigned interpretation of LogicalMaximum payload.
+    /// Used when `logical_min >= 0 && logical_max < 0` to resolve the HID 1.11
+    /// §6.2.2.7 sign-extension ambiguity (e.g. 1-byte 0xFF = 255, not -1).
+    logical_max_unsigned: u32,
 
     // Local items (reset after each Main item)
     usages: Vec<UsageEntry>,
 
     // Accumulated results
-    lamp_array_reports: HashMap<String, ReportInfo>,
-    led_rgb_channels: HashMap<u8, LedRgbChannelBuilder>,
+    lamp_array_reports: LampArrayReports,
+    led_rgb_channels: Vec<(u8, LedRgbChannelBuilder)>,
 
     // Per-report accumulated data bits for final size calculation
-    report_data_bits: HashMap<u8, u32>,
+    report_data_bits: Vec<(u8, u32)>,
 
     // Collection / context tracking
     collection_depth: u32,
-    current_lighting_report_name: Option<String>,
+    current_lighting_report_kind: Option<LampArrayReportKind>,
     in_rgb_led_collection: bool,
     /// Whether we are inside a LampArray Application collection (Usage Page 0x59, Usage 0x01).
     in_lamp_array_app: bool,
+
+    // Depth at which each context flag was set (for precise end-collection reset).
+    lamp_array_app_depth: Option<u32>,
+    lighting_report_depth: Option<u32>,
+    rgb_led_collection_depth: Option<u32>,
 }
 
 impl ParserState {
@@ -269,14 +302,18 @@ impl ParserState {
             report_count: 0,
             logical_min: 0,
             logical_max: 0,
+            logical_max_unsigned: 0,
             usages: Vec::new(),
-            lamp_array_reports: HashMap::new(),
-            led_rgb_channels: HashMap::new(),
-            report_data_bits: HashMap::new(),
+            lamp_array_reports: LampArrayReports::default(),
+            led_rgb_channels: Vec::new(),
+            report_data_bits: Vec::new(),
             collection_depth: 0,
-            current_lighting_report_name: None,
+            current_lighting_report_kind: None,
             in_rgb_led_collection: false,
             in_lamp_array_app: false,
+            lamp_array_app_depth: None,
+            lighting_report_depth: None,
+            rgb_led_collection_depth: None,
         }
     }
 
@@ -286,7 +323,10 @@ impl ParserState {
         match tag {
             TAG_USAGE_PAGE => self.usage_page = val,
             TAG_LOGICAL_MIN => self.logical_min = payload_value_signed(payload),
-            TAG_LOGICAL_MAX => self.logical_max = payload_value_signed(payload),
+            TAG_LOGICAL_MAX => {
+                self.logical_max = payload_value_signed(payload);
+                self.logical_max_unsigned = val;
+            }
             TAG_REPORT_ID => self.report_id = val as u8,
             TAG_REPORT_SIZE => self.report_size = val,
             TAG_REPORT_COUNT => self.report_count = val,
@@ -337,6 +377,7 @@ impl ParserState {
                 if let UsageEntry::Single(usage) = entry {
                     if *usage == USAGE_LAMP_ARRAY {
                         self.in_lamp_array_app = true;
+                        self.lamp_array_app_depth = Some(self.collection_depth);
                     }
                 }
             }
@@ -346,8 +387,9 @@ impl ParserState {
         if self.usage_page == USAGE_PAGE_LIGHTING && self.in_lamp_array_app {
             for entry in &self.usages {
                 if let UsageEntry::Single(usage) = entry {
-                    if let Some(name) = lamp_array_report_name(*usage) {
-                        self.current_lighting_report_name = Some(name.to_string());
+                    if let Some(kind) = LampArrayReportKind::from_usage(*usage) {
+                        self.current_lighting_report_kind = Some(kind);
+                        self.lighting_report_depth = Some(self.collection_depth);
                     }
                 }
             }
@@ -359,7 +401,15 @@ impl ParserState {
                 if let UsageEntry::Single(usage) = entry {
                     if *usage == USAGE_RGB_LED {
                         self.in_rgb_led_collection = true;
-                        self.led_rgb_channels.entry(self.report_id).or_default();
+                        self.rgb_led_collection_depth = Some(self.collection_depth);
+                        if !self
+                            .led_rgb_channels
+                            .iter()
+                            .any(|(rid, _)| *rid == self.report_id)
+                        {
+                            self.led_rgb_channels
+                                .push((self.report_id, LedRgbChannelBuilder::default()));
+                        }
                     }
                 }
             }
@@ -369,14 +419,20 @@ impl ParserState {
     }
 
     fn on_end_collection(&mut self) {
-        self.collection_depth = self.collection_depth.saturating_sub(1);
-        if self.collection_depth <= 1 {
-            self.current_lighting_report_name = None;
+        // Check BEFORE decrementing — we are leaving the collection at this depth.
+        if Some(self.collection_depth) == self.lighting_report_depth {
+            self.current_lighting_report_kind = None;
+            self.lighting_report_depth = None;
+        }
+        if Some(self.collection_depth) == self.rgb_led_collection_depth {
             self.in_rgb_led_collection = false;
+            self.rgb_led_collection_depth = None;
         }
-        if self.collection_depth == 0 {
+        if Some(self.collection_depth) == self.lamp_array_app_depth {
             self.in_lamp_array_app = false;
+            self.lamp_array_app_depth = None;
         }
+        self.collection_depth = self.collection_depth.saturating_sub(1);
         self.usages.clear();
     }
 
@@ -385,8 +441,16 @@ impl ParserState {
         let rid = self.report_id;
 
         // Capture absolute bit offset before this item for channel positioning
-        let bit_offset_before = self.report_data_bits.get(&rid).copied().unwrap_or(0);
-        *self.report_data_bits.entry(rid).or_insert(0) += total_bits;
+        let bit_offset_before = self
+            .report_data_bits
+            .iter()
+            .find(|(r, _)| *r == rid)
+            .map(|(_, bits)| *bits)
+            .unwrap_or(0);
+        match self.report_data_bits.iter_mut().find(|(r, _)| *r == rid) {
+            Some((_, bits)) => *bits += total_bits,
+            None => self.report_data_bits.push((rid, total_bits)),
+        }
 
         // Determine report type from the Main item tag
         let report_type = match tag {
@@ -397,23 +461,48 @@ impl ParserState {
 
         // Lighting Page (0x59): record report info
         if self.usage_page == USAGE_PAGE_LIGHTING {
-            if let Some(ref name) = self.current_lighting_report_name {
-                self.lamp_array_reports
-                    .entry(name.clone())
-                    .or_insert(ReportInfo {
-                        report_id: rid,
-                        size: 0,
-                    });
+            if let Some(kind) = self.current_lighting_report_kind {
+                let rinfo = ReportInfo {
+                    report_id: rid,
+                    size: 0,
+                };
+                let slot = match kind {
+                    LampArrayReportKind::Attributes => &mut self.lamp_array_reports.attributes,
+                    LampArrayReportKind::AttrRequest => &mut self.lamp_array_reports.attr_request,
+                    LampArrayReportKind::AttrResponse => &mut self.lamp_array_reports.attr_response,
+                    LampArrayReportKind::MultiUpdate => &mut self.lamp_array_reports.multi_update,
+                    LampArrayReportKind::RangeUpdate => &mut self.lamp_array_reports.range_update,
+                    LampArrayReportKind::Control => &mut self.lamp_array_reports.control,
+                };
+                if slot.is_none() {
+                    *slot = Some(rinfo);
+                }
             }
         }
 
         // LED Page (0x08): record channel byte offsets (absolute within report)
         if self.usage_page == USAGE_PAGE_LED && self.in_rgb_led_collection {
-            let logical_max = self.logical_max;
-            let builder = self.led_rgb_channels.entry(rid).or_default();
+            let builder = match self.led_rgb_channels.iter_mut().find(|(r, _)| *r == rid) {
+                Some((_, b)) => b,
+                None => {
+                    self.led_rgb_channels
+                        .push((rid, LedRgbChannelBuilder::default()));
+                    &mut self.led_rgb_channels.last_mut().unwrap().1
+                }
+            };
             builder.report_type = report_type;
 
-            let lmax = logical_max.max(0) as u32;
+            // HID 1.11 §6.2.2.7: LogicalMin/Max are signed, but when LogicalMin
+            // is non-negative and LogicalMax appears negative after sign extension,
+            // the intended range is unsigned (e.g. 1-byte 0xFF = 255, not -1).
+            // Section 11.7: LED Page channels use LogicalMin=0.
+            // MS reference (WaratahCmd) avoids this by using 2-byte payloads for
+            // LogicalMax(255), but third-party devices may use 1-byte payloads.
+            let lmax = if self.logical_min >= 0 && self.logical_max < 0 {
+                self.logical_max_unsigned
+            } else {
+                self.logical_max.max(0) as u32
+            };
             for (i, entry) in self.usages.iter().enumerate() {
                 if let UsageEntry::Single(usage) = entry {
                     let byte_off = ((bit_offset_before + i as u32 * self.report_size) / 8) as usize;
@@ -446,15 +535,29 @@ impl ParserState {
 
     // --- Finalize ---
 
-    fn finalize(mut self) -> (HashMap<String, ReportInfo>, Vec<LedRgbChannelBuilder>) {
+    fn finalize(mut self) -> (LampArrayReports, Vec<LedRgbChannelBuilder>) {
+        // Helper to look up accumulated bits for a report ID.
+        let bits_for = |rid: u8| -> u32 {
+            self.report_data_bits
+                .iter()
+                .find(|(r, _)| *r == rid)
+                .map(|(_, bits)| *bits)
+                .unwrap_or(0)
+        };
+
         // Fill in byte sizes for LampArray reports
-        for rinfo in self.lamp_array_reports.values_mut() {
-            let bits = self
-                .report_data_bits
-                .get(&rinfo.report_id)
-                .copied()
-                .unwrap_or(0);
-            rinfo.size = bits.div_ceil(8) as usize;
+        for rinfo in [
+            &mut self.lamp_array_reports.attributes,
+            &mut self.lamp_array_reports.attr_request,
+            &mut self.lamp_array_reports.attr_response,
+            &mut self.lamp_array_reports.multi_update,
+            &mut self.lamp_array_reports.range_update,
+            &mut self.lamp_array_reports.control,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            rinfo.size = bits_for(rinfo.report_id).div_ceil(8) as usize;
         }
 
         // Collect complete LED RGB channel builders with computed sizes
@@ -464,8 +567,7 @@ impl ParserState {
             .filter_map(|(rid, mut builder)| {
                 if builder.is_complete() {
                     builder.report_id = rid;
-                    let bits = self.report_data_bits.get(&rid).copied().unwrap_or(0);
-                    builder.report_size = bits.div_ceil(8) as usize;
+                    builder.report_size = bits_for(rid).div_ceil(8) as usize;
                     Some(builder)
                 } else {
                     None
@@ -568,7 +670,7 @@ fn payload_value(payload: &[u8]) -> u32 {
 /// Returns:
 ///   - lamp_array_reports: map of report name -> ReportInfo for Lighting Page (0x59)
 ///   - led_rgb_builders: list of LedRgbChannelBuilder for LED Page (0x08) RGB LED
-fn parse_descriptor(desc: &[u8]) -> (HashMap<String, ReportInfo>, Vec<LedRgbChannelBuilder>) {
+fn parse_descriptor(desc: &[u8]) -> (LampArrayReports, Vec<LedRgbChannelBuilder>) {
     let mut state = ParserState::new();
     let mut offset = 0;
 
@@ -652,9 +754,8 @@ pub fn discover_devices() -> Vec<DeviceInfo> {
         // Check for LampArray (Usage Page 0x59)
         // Minimum: attributes report + at least one update report.
         // Control report (AutonomousMode) is optional per Section 26.10.1.
-        if lamp_reports.contains_key("attributes")
-            && (lamp_reports.contains_key("range_update")
-                || lamp_reports.contains_key("multi_update"))
+        if lamp_reports.attributes.is_some()
+            && (lamp_reports.range_update.is_some() || lamp_reports.multi_update.is_some())
         {
             devices.push(DeviceInfo::LampArray(LampArrayInfo {
                 hidraw_path: format!("/dev/{hidraw_name}"),

@@ -6,7 +6,7 @@
 use lexopt::prelude::*;
 
 use crate::descriptor::DeviceInfo;
-use crate::device::{LampArrayDevice, LedRgbDevice};
+use crate::device::{LampArrayDevice, LampColor, LedRgbDevice};
 use crate::error::Error;
 
 // --- Color presets ---
@@ -198,7 +198,13 @@ fn cmd_set_lamp(info: &DeviceInfo, lamps: &[(u16, String)], intensity: u8) -> Re
                         )));
                     }
                 };
-                colors.push((*id, rgb.0, rgb.1, rgb.2, intensity));
+                colors.push(LampColor {
+                    lamp_id: *id,
+                    red: rgb.0,
+                    green: rgb.1,
+                    blue: rgb.2,
+                    intensity,
+                });
             }
             dev.set_lamp_colors(&colors)?;
             println!("Set {} lamp(s) on {}", colors.len(), dev.name());
@@ -480,9 +486,9 @@ pub fn run() {
                 eprintln!("Error: Permission denied on {path}.");
                 eprintln!("Run with sudo or set up a udev rule — see README.");
             }
-            Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
-                eprintln!("Error: Permission denied on {}.", info.hidraw_path());
-                eprintln!("Run with sudo or set up a udev rule — see README.");
+            Error::DeviceNotFound { path } => {
+                eprintln!("Error: Device not found at {path}.");
+                eprintln!("Check that the device is connected and the path is correct.");
             }
             _ => {
                 eprintln!("Error: {e}");
