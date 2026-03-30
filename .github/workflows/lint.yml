@@ -7,11 +7,13 @@ on:
     branches: [master]
 
 jobs:
-  ruff:
+  rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/ruff-action@v3
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          args: check --output-format=github
-      - run: ruff format --check --diff
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo build --release

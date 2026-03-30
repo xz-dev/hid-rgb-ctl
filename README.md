@@ -25,14 +25,14 @@ Linux command-line tool for controlling RGB lighting via standard HID protocols.
   vendor/product IDs
 - Supports preset colors, decimal RGB, hex color codes, and intensity control
 - Toggle autonomous/manual mode on LampArray devices
-- Zero external dependencies — Python 3.9+ standard library only
+- Minimal dependencies — only `lexopt` (CLI parsing) and `libc` (ioctl)
 
 ## Install
 
 ```sh
-pipx install git+https://github.com/xz-dev/hid-rgb-ctl.git
+cargo install --git https://github.com/xz-dev/hid-rgb-ctl.git
 # or from local clone
-pipx install .
+cargo install --path .
 ```
 
 ## Usage
