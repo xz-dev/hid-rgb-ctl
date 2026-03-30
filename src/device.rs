@@ -493,15 +493,14 @@ impl<'a> LedRgbDevice<'a> {
         let mut buf = vec![0u8; self.info.report_size + 1];
         buf[0] = self.info.report_id;
 
-        // Scale color channels from 0-255 to device's LogicalMaximum.
-        // When channel_logical_max == 255 this is an identity transform.
-        let lmax = self.info.channel_logical_max;
-        buf[1 + self.info.red_offset] = scale_u8(r, lmax);
-        buf[1 + self.info.blue_offset] = scale_u8(b, lmax);
-        buf[1 + self.info.green_offset] = scale_u8(g, lmax);
+        // Scale color channels from 0-255 to each channel's LogicalMaximum.
+        // When logical_max == 255 this is an identity transform.
+        buf[1 + self.info.red_offset] = scale_u8(r, self.info.red_logical_max);
+        buf[1 + self.info.blue_offset] = scale_u8(b, self.info.blue_logical_max);
+        buf[1 + self.info.green_offset] = scale_u8(g, self.info.green_logical_max);
 
         if let Some(off) = self.info.intensity_offset {
-            let int_max = self.info.intensity_logical_max.unwrap_or(lmax);
+            let int_max = self.info.intensity_logical_max.unwrap_or(255);
             buf[1 + off] = scale_u8(intensity, int_max);
         }
 

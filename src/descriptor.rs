@@ -142,8 +142,10 @@ pub struct LedRgbInfo {
     pub channel_size: u32,
     /// The HID report type (Feature or Output).
     pub report_type: ReportType,
-    /// LogicalMaximum of color channels from the descriptor (typically 255).
-    pub channel_logical_max: u32,
+    /// LogicalMaximum per color channel from the descriptor (typically 255).
+    pub red_logical_max: u32,
+    pub green_logical_max: u32,
+    pub blue_logical_max: u32,
     /// LogicalMaximum of the Intensity channel (spec recommends 100).
     /// None if the device has no intensity channel.
     pub intensity_logical_max: Option<u32>,
@@ -188,8 +190,10 @@ struct LedRgbChannelBuilder {
     channel_size: u32,
     /// The HID report type (Feature, Output, or Input) for this RGB LED.
     report_type: ReportType,
-    /// LogicalMaximum of color channels (typically 255).
-    channel_logical_max: u32,
+    /// LogicalMaximum per color channel (typically 255 for all).
+    red_logical_max: u32,
+    green_logical_max: u32,
+    blue_logical_max: u32,
     /// LogicalMaximum of the Intensity channel (spec recommends 100).
     intensity_logical_max: Option<u32>,
 }
@@ -205,7 +209,9 @@ impl Default for LedRgbChannelBuilder {
             intensity_offset: None,
             channel_size: 8, // Typical default per HID spec
             report_type: ReportType::Feature,
-            channel_logical_max: 255,
+            red_logical_max: 255,
+            green_logical_max: 255,
+            blue_logical_max: 255,
             intensity_logical_max: None,
         }
     }
@@ -276,11 +282,11 @@ impl ParserState {
 
     // --- Global item handlers ---
 
-    fn handle_global(&mut self, tag: u8, val: u32) {
+    fn handle_global(&mut self, tag: u8, val: u32, payload: &[u8]) {
         match tag {
             TAG_USAGE_PAGE => self.usage_page = val,
-            TAG_LOGICAL_MIN => self.logical_min = val as i32,
-            TAG_LOGICAL_MAX => self.logical_max = val as i32,
+            TAG_LOGICAL_MIN => self.logical_min = payload_value_signed(payload),
+            TAG_LOGICAL_MAX => self.logical_max = payload_value_signed(payload),
             TAG_REPORT_ID => self.report_id = val as u8,
             TAG_REPORT_SIZE => self.report_size = val,
             TAG_REPORT_COUNT => self.report_count = val,
@@ -407,6 +413,7 @@ impl ParserState {
             let builder = self.led_rgb_channels.entry(rid).or_default();
             builder.report_type = report_type;
 
+            let lmax = logical_max.max(0) as u32;
             for (i, entry) in self.usages.iter().enumerate() {
                 if let UsageEntry::Single(usage) = entry {
                     let byte_off = ((bit_offset_before + i as u32 * self.report_size) / 8) as usize;
@@ -414,17 +421,19 @@ impl ParserState {
                         USAGE_RED_LED_CHANNEL => {
                             builder.red_offset = Some(byte_off);
                             builder.channel_size = self.report_size;
-                            builder.channel_logical_max = logical_max.max(0) as u32;
+                            builder.red_logical_max = lmax;
                         }
                         USAGE_BLUE_LED_CHANNEL => {
                             builder.blue_offset = Some(byte_off);
+                            builder.blue_logical_max = lmax;
                         }
                         USAGE_GREEN_LED_CHANNEL => {
                             builder.green_offset = Some(byte_off);
+                            builder.green_logical_max = lmax;
                         }
                         USAGE_LED_INTENSITY => {
                             builder.intensity_offset = Some(byte_off);
-                            builder.intensity_logical_max = Some(logical_max.max(0) as u32);
+                            builder.intensity_logical_max = Some(lmax);
                         }
                         _ => {}
                     }
@@ -512,6 +521,30 @@ fn parse_item(data: &[u8], offset: usize) -> Option<(u8, u8, &[u8], usize)> {
     Some((tag, item_type, payload, 1 + size))
 }
 
+/// Decode a HID item payload as a signed integer (sign-extended).
+///
+/// HID 1.11 §6.2.2.7 requires LogicalMinimum/LogicalMaximum to be
+/// interpreted as signed values with sign extension based on payload size.
+fn payload_value_signed(payload: &[u8]) -> i32 {
+    match payload.len() {
+        0 => 0,
+        1 => payload[0] as i8 as i32,
+        2 => i16::from_le_bytes([payload[0], payload[1]]) as i32,
+        4 => i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+        _ => {
+            // Fallback: little-endian decode up to 4 bytes, then sign-extend
+            let mut val = 0u32;
+            let len = payload.len().min(4);
+            for (i, &b) in payload.iter().enumerate().take(len) {
+                val |= (b as u32) << (8 * i);
+            }
+            // Sign-extend from the actual byte width
+            let shift = 32 - (len * 8) as u32;
+            ((val << shift) as i32) >> shift
+        }
+    }
+}
+
 /// Decode a HID item payload as an unsigned integer.
 fn payload_value(payload: &[u8]) -> u32 {
     match payload.len() {
@@ -547,7 +580,7 @@ fn parse_descriptor(desc: &[u8]) -> (HashMap<String, ReportInfo>, Vec<LedRgbChan
         let val = payload_value(payload);
 
         match item_type {
-            1 => state.handle_global(tag, val), // Global
+            1 => state.handle_global(tag, val, payload), // Global
             2 => state.handle_local(tag, val),  // Local
             0 => state.handle_main(tag, val), // Main (val is collection type for Collection items)
             _ => {}
@@ -642,7 +675,9 @@ pub fn discover_devices() -> Vec<DeviceInfo> {
                 intensity_offset: builder.intensity_offset,
                 channel_size: builder.channel_size,
                 report_type: builder.report_type,
-                channel_logical_max: builder.channel_logical_max,
+                red_logical_max: builder.red_logical_max,
+                green_logical_max: builder.green_logical_max,
+                blue_logical_max: builder.blue_logical_max,
                 intensity_logical_max: builder.intensity_logical_max,
             }));
         }
