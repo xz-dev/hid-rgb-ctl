@@ -279,7 +279,7 @@ enum Command {
         intensity: u8,
     },
     Auto {
-        state: String,
+        enabled: bool,
     },
 }
 
@@ -386,12 +386,16 @@ fn parse_args() -> Result<Args, Error> {
                         let state = state_val.into_string().map_err(|_| {
                             Error::InvalidArgument("invalid UTF-8 in auto state".to_string())
                         })?;
-                        if state != "on" && state != "off" {
-                            return Err(Error::InvalidArgument(format!(
-                                "auto: expected 'on' or 'off', got '{state}'"
-                            )));
-                        }
-                        command = Some(Command::Auto { state });
+                        let enabled = match state.as_str() {
+                            "on" => true,
+                            "off" => false,
+                            _ => {
+                                return Err(Error::InvalidArgument(format!(
+                                    "auto: expected 'on' or 'off', got '{state}'"
+                                )));
+                            }
+                        };
+                        command = Some(Command::Auto { enabled });
                     }
                     _ => {
                         return Err(Error::InvalidArgument(format!("unknown command: {s}")));
@@ -477,7 +481,7 @@ pub fn run() {
             }
             cmd_set_lamp(info, &lamps, intensity)
         }
-        Command::Auto { state } => cmd_auto(info, state == "on"),
+        Command::Auto { enabled } => cmd_auto(info, enabled),
     };
 
     if let Err(e) = result {

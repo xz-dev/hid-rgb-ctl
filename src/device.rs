@@ -151,6 +151,12 @@ impl HidrawFd {
         if ret < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        // Truncate to the actual number of bytes returned by the kernel.
+        // The Linux HIDRAW driver returns the real transfer size; if the
+        // device responded with fewer bytes the remainder is undefined.
+        // Callers (parse_lamp_response, get_attributes_with_fd) validate
+        // the resulting length and produce TruncatedReport errors as needed.
+        buf.truncate(ret as usize);
         Ok(buf)
     }
 
