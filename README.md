@@ -123,7 +123,7 @@ No autonomous mode or lamp enumeration.
 
 ## References
 
-- [USB HID Usage Tables v1.4](https://usb.org/document-library/hid-usage-tables-14) —
+- [USB HID Usage Tables v1.4](https://www.usb.org/sites/default/files/hut1_4.pdf) —
   Section 26 (Lighting and Illumination), Section 11.7 (Multicolor RGB LED)
 - [Microsoft Dynamic Lighting](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/dynamic-lighting-devices) —
   Windows implementation guide for the same HID LampArray standard

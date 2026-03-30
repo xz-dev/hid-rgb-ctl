@@ -57,9 +57,9 @@ fn parse_color(args: &[String]) -> Option<(u8, u8, u8)> {
             return Some(rgb);
         }
 
-        // Try hex
+        // Try hex (is_ascii guard prevents panic on multi-byte UTF-8 indexing)
         let s = name.strip_prefix('#').unwrap_or(name);
-        if s.len() == 6 {
+        if s.len() == 6 && s.is_ascii() {
             let r = u8::from_str_radix(&s[0..2], 16).ok()?;
             let g = u8::from_str_radix(&s[2..4], 16).ok()?;
             let b = u8::from_str_radix(&s[4..6], 16).ok()?;
@@ -96,8 +96,8 @@ fn cmd_list(devices: &[DeviceInfo]) {
 
     for d in devices {
         let summary = match d {
-            DeviceInfo::LampArray(info) => LampArrayDevice::new(info.clone()).summary(),
-            DeviceInfo::LedRgb(info) => LedRgbDevice::new(info.clone()).summary(),
+            DeviceInfo::LampArray(info) => LampArrayDevice::new(info).summary(),
+            DeviceInfo::LedRgb(info) => LedRgbDevice::new(info).summary(),
         };
         println!("{}  {}  {}", d.hidraw_path(), d.name(), summary);
     }
@@ -106,9 +106,9 @@ fn cmd_list(devices: &[DeviceInfo]) {
 fn cmd_get(info: &DeviceInfo) {
     match info {
         DeviceInfo::LampArray(la_info) => {
-            let dev = LampArrayDevice::new(la_info.clone());
-            match dev.get_attributes() {
-                Ok(attrs) => {
+            let dev = LampArrayDevice::new(la_info);
+            match dev.get_attributes_and_lamps() {
+                Ok((attrs, lamps)) => {
                     println!("Device: {}", dev.name());
                     println!("Protocol: HID LampArray (Usage Page 0x59)");
                     println!("Path: {}", dev.path());
@@ -122,8 +122,8 @@ fn cmd_get(info: &DeviceInfo) {
                     );
                     println!("Min update interval: {} us", attrs.min_update_interval_us);
 
-                    for i in 0..attrs.lamp_count {
-                        match dev.get_lamp(i) {
+                    for (i, result) in lamps.iter().enumerate() {
+                        match result {
                             Ok(lamp) => {
                                 println!("\nLamp {}:", lamp.lamp_id);
                                 println!(
@@ -157,7 +157,7 @@ fn cmd_get(info: &DeviceInfo) {
             }
         }
         DeviceInfo::LedRgb(rgb_info) => {
-            let dev = LedRgbDevice::new(rgb_info.clone());
+            let dev = LedRgbDevice::new(rgb_info);
             let attrs = dev.get_attributes();
             println!("Device: {}", attrs.name);
             println!("Protocol: {}", attrs.protocol);
@@ -175,11 +175,11 @@ fn cmd_get(info: &DeviceInfo) {
 fn cmd_set(info: &DeviceInfo, r: u8, g: u8, b: u8, intensity: u8) -> Result<(), Error> {
     match info {
         DeviceInfo::LampArray(la_info) => {
-            let dev = LampArrayDevice::new(la_info.clone());
+            let dev = LampArrayDevice::new(la_info);
             dev.set_color(r, g, b, intensity)?;
         }
         DeviceInfo::LedRgb(rgb_info) => {
-            let dev = LedRgbDevice::new(rgb_info.clone());
+            let dev = LedRgbDevice::new(rgb_info);
             dev.set_color(r, g, b, intensity)?;
         }
     }
@@ -194,7 +194,7 @@ fn cmd_set(info: &DeviceInfo, r: u8, g: u8, b: u8, intensity: u8) -> Result<(), 
 fn cmd_auto(info: &DeviceInfo, enabled: bool) -> Result<(), Error> {
     match info {
         DeviceInfo::LampArray(la_info) => {
-            let dev = LampArrayDevice::new(la_info.clone());
+            let dev = LampArrayDevice::new(la_info);
             dev.set_autonomous(enabled)?;
             let state = if enabled {
                 "on (device controls)"
@@ -218,7 +218,7 @@ fn print_help() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -V, --version    Show version and exit");
-    eprintln!("  -p PATH          hidraw device path (e.g. /dev/hidraw1)");
+    eprintln!("  -p, --path PATH  hidraw device path (e.g. /dev/hidraw1)");
     eprintln!("                   If omitted, uses the first detected device.");
     eprintln!();
     eprintln!("Commands:");
@@ -288,7 +288,7 @@ fn parse_args() -> Result<Args, Error> {
                 print_help();
                 std::process::exit(0);
             }
-            Short('p') => {
+            Short('p') | Long("path") => {
                 path =
                     Some(parser.value()?.into_string().map_err(|_| {
                         Error::InvalidArgument("invalid UTF-8 in path".to_string())

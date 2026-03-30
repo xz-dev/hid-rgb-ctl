@@ -145,12 +145,12 @@ fn require_report<'a>(
 /// interrogation -> disable autonomous -> update lamps -> (re-enable autonomous)
 ///
 /// Report IDs and sizes come from descriptor parsing, not hardcoded.
-pub struct LampArrayDevice {
-    info: LampArrayInfo,
+pub struct LampArrayDevice<'a> {
+    info: &'a LampArrayInfo,
 }
 
-impl LampArrayDevice {
-    pub fn new(info: LampArrayInfo) -> Self {
+impl<'a> LampArrayDevice<'a> {
+    pub fn new(info: &'a LampArrayInfo) -> Self {
         Self { info }
     }
 
@@ -251,6 +251,22 @@ impl LampArrayDevice {
         })
     }
 
+    /// Read attributes and all lamp info using a single fd.
+    ///
+    /// More efficient than calling `get_attributes()` + `get_lamp()` in a loop,
+    /// which opens a new fd for each call.
+    pub fn get_attributes_and_lamps(
+        &self,
+    ) -> Result<(LampArrayAttributes, Vec<Result<LampAttributes>>)> {
+        let fd = HidrawFd::open(&self.info.hidraw_path)?;
+        let attrs = self.get_attributes_with_fd(&fd)?;
+        let mut lamps = Vec::with_capacity(attrs.lamp_count as usize);
+        for i in 0..attrs.lamp_count {
+            lamps.push(self.get_lamp_with_fd(&fd, i));
+        }
+        Ok((attrs, lamps))
+    }
+
     /// Toggle AutonomousMode (Section 26.5, 26.10.1).
     ///
     /// When `true`: device controls lamps autonomously (built-in effects).
@@ -340,12 +356,12 @@ impl LampArrayDevice {
 ///   - LED Intensity (Usage 0x56, optional)
 ///
 /// Byte offsets are determined by descriptor parsing, not assumed.
-pub struct LedRgbDevice {
-    info: LedRgbInfo,
+pub struct LedRgbDevice<'a> {
+    info: &'a LedRgbInfo,
 }
 
-impl LedRgbDevice {
-    pub fn new(info: LedRgbInfo) -> Self {
+impl<'a> LedRgbDevice<'a> {
+    pub fn new(info: &'a LedRgbInfo) -> Self {
         Self { info }
     }
 

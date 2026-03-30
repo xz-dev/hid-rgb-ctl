@@ -35,8 +35,6 @@ const USAGE_LED_INTENSITY: u32 = 0x56;
 // HID item tags (prefix byte with size bits masked out)
 // Global items
 const TAG_USAGE_PAGE: u8 = 0x04;
-const TAG_LOGICAL_MIN: u8 = 0x14;
-const TAG_LOGICAL_MAX: u8 = 0x24;
 const TAG_REPORT_SIZE: u8 = 0x74;
 const TAG_REPORT_ID: u8 = 0x84;
 const TAG_REPORT_COUNT: u8 = 0x94;
@@ -197,10 +195,6 @@ struct ParserState {
     report_id: u8,
     report_size: u32,
     report_count: u32,
-    #[allow(dead_code)]
-    logical_min: i32,
-    #[allow(dead_code)]
-    logical_max: i32,
 
     // Local items (reset after each Main item)
     usages: Vec<UsageEntry>,
@@ -211,9 +205,6 @@ struct ParserState {
 
     // Per-report accumulated data bits for final size calculation
     report_data_bits: HashMap<u8, u32>,
-
-    // Per-(context, report_id) bit offset tracking for LED channel offsets
-    led_report_bit_offsets: HashMap<u8, u32>,
 
     // Collection / context tracking
     collection_depth: u32,
@@ -228,13 +219,10 @@ impl ParserState {
             report_id: 0,
             report_size: 0,
             report_count: 0,
-            logical_min: 0,
-            logical_max: 0,
             usages: Vec::new(),
             lamp_array_reports: HashMap::new(),
             led_rgb_channels: HashMap::new(),
             report_data_bits: HashMap::new(),
-            led_report_bit_offsets: HashMap::new(),
             collection_depth: 0,
             current_lighting_report_name: None,
             in_rgb_led_collection: false,
@@ -243,14 +231,12 @@ impl ParserState {
 
     // --- Global item handlers ---
 
-    fn handle_global(&mut self, tag: u8, val: u32, payload: &[u8]) {
+    fn handle_global(&mut self, tag: u8, val: u32) {
         match tag {
             TAG_USAGE_PAGE => self.usage_page = val,
             TAG_REPORT_ID => self.report_id = val as u8,
             TAG_REPORT_SIZE => self.report_size = val,
             TAG_REPORT_COUNT => self.report_count = val,
-            TAG_LOGICAL_MIN => self.logical_min = payload_value_signed(payload),
-            TAG_LOGICAL_MAX => self.logical_max = payload_value_signed(payload),
             _ => {}
         }
     }
@@ -328,6 +314,9 @@ impl ParserState {
     fn on_data_item(&mut self) {
         let total_bits = self.report_size * self.report_count;
         let rid = self.report_id;
+
+        // Capture absolute bit offset before this item for channel positioning
+        let bit_offset_before = self.report_data_bits.get(&rid).copied().unwrap_or(0);
         *self.report_data_bits.entry(rid).or_insert(0) += total_bits;
 
         // Lighting Page (0x59): record report info
@@ -342,15 +331,13 @@ impl ParserState {
             }
         }
 
-        // LED Page (0x08): record channel byte offsets
+        // LED Page (0x08): record channel byte offsets (absolute within report)
         if self.usage_page == USAGE_PAGE_LED && self.in_rgb_led_collection {
-            let current_bits = *self.led_report_bit_offsets.entry(rid).or_insert(0);
-
             let builder = self.led_rgb_channels.entry(rid).or_default();
 
             for (i, entry) in self.usages.iter().enumerate() {
                 if let UsageEntry::Single(usage) = entry {
-                    let byte_off = ((current_bits + i as u32 * self.report_size) / 8) as usize;
+                    let byte_off = ((bit_offset_before + i as u32 * self.report_size) / 8) as usize;
                     match *usage {
                         USAGE_RED_LED_CHANNEL => {
                             builder.red_offset = Some(byte_off);
@@ -369,8 +356,6 @@ impl ParserState {
                     }
                 }
             }
-
-            *self.led_report_bit_offsets.entry(rid).or_insert(0) += total_bits;
         }
 
         self.usages.clear();
@@ -453,23 +438,6 @@ fn payload_value(payload: &[u8]) -> u32 {
     }
 }
 
-/// Decode a HID item payload as a signed integer.
-fn payload_value_signed(payload: &[u8]) -> i32 {
-    match payload.len() {
-        0 => 0,
-        1 => payload[0] as i8 as i32,
-        2 => i16::from_le_bytes([payload[0], payload[1]]) as i32,
-        4 => i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
-        _ => {
-            let mut val = 0u32;
-            for (i, &b) in payload.iter().enumerate().take(4) {
-                val |= (b as u32) << (8 * i);
-            }
-            val as i32
-        }
-    }
-}
-
 /// Parse a binary HID report descriptor.
 ///
 /// Returns:
@@ -487,9 +455,9 @@ fn parse_descriptor(desc: &[u8]) -> (HashMap<String, ReportInfo>, Vec<LedRgbChan
         let val = payload_value(payload);
 
         match item_type {
-            1 => state.handle_global(tag, val, payload), // Global
-            2 => state.handle_local(tag, val),           // Local
-            0 => state.handle_main(tag),                 // Main
+            1 => state.handle_global(tag, val), // Global
+            2 => state.handle_local(tag, val),  // Local
+            0 => state.handle_main(tag),        // Main
             _ => {}
         }
     }
@@ -569,20 +537,19 @@ pub fn discover_devices() -> Vec<DeviceInfo> {
         }
 
         // Check for LED Page RGB LED (Usage Page 0x08)
+        // Builders are already filtered to is_complete() by finalize()
         for builder in led_rgb_builders {
-            if builder.is_complete() {
-                devices.push(DeviceInfo::LedRgb(LedRgbInfo {
-                    hidraw_path: format!("/dev/{hidraw_name}"),
-                    name: get_hid_name(&hidraw_name),
-                    report_id: builder.report_id,
-                    report_size: builder.report_size,
-                    red_offset: builder.red_offset.unwrap(),
-                    blue_offset: builder.blue_offset.unwrap(),
-                    green_offset: builder.green_offset.unwrap(),
-                    intensity_offset: builder.intensity_offset,
-                    channel_size: builder.channel_size,
-                }));
-            }
+            devices.push(DeviceInfo::LedRgb(LedRgbInfo {
+                hidraw_path: format!("/dev/{hidraw_name}"),
+                name: get_hid_name(&hidraw_name),
+                report_id: builder.report_id,
+                report_size: builder.report_size,
+                red_offset: builder.red_offset.unwrap(),
+                blue_offset: builder.blue_offset.unwrap(),
+                green_offset: builder.green_offset.unwrap(),
+                intensity_offset: builder.intensity_offset,
+                channel_size: builder.channel_size,
+            }));
         }
     }
 

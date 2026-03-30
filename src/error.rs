@@ -12,12 +12,6 @@ pub enum Error {
     PermissionDenied { path: String },
     /// A required HID report type is missing from the device descriptor.
     MissingReport { report_name: String },
-    /// No RGB device found at the specified path.
-    DeviceNotFound { path: String },
-    /// No HID RGB devices detected on the system.
-    NoDevices,
-    /// Invalid color specification.
-    InvalidColor,
     /// The `auto` command was used on a non-LampArray device.
     NoAutonomousMode,
     /// Invalid subcommand or argument.
@@ -36,15 +30,6 @@ impl fmt::Display for Error {
             }
             Self::MissingReport { report_name } => {
                 write!(f, "Device has no '{report_name}' report")
-            }
-            Self::DeviceNotFound { path } => {
-                write!(f, "No RGB device found at {path}")
-            }
-            Self::NoDevices => {
-                write!(f, "No HID RGB devices found")
-            }
-            Self::InvalidColor => {
-                write!(f, "Invalid color")
             }
             Self::NoAutonomousMode => {
                 write!(

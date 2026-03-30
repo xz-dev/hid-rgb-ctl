@@ -14,17 +14,18 @@
 //! for dev in &devices {
 //!     match dev {
 //!         DeviceInfo::LampArray(info) => {
-//!             let device = LampArrayDevice::new(info.clone());
+//!             let device = LampArrayDevice::new(info);
 //!             device.set_color(255, 0, 0, 255).unwrap();
 //!         }
 //!         DeviceInfo::LedRgb(info) => {
-//!             let device = LedRgbDevice::new(info.clone());
+//!             let device = LedRgbDevice::new(info);
 //!             device.set_color(255, 0, 0, 255).unwrap();
 //!         }
 //!     }
 //! }
 //! ```
 
+#[doc(hidden)]
 pub mod cli;
 pub mod descriptor;
 pub mod device;
