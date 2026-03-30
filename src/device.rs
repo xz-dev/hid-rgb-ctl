@@ -53,7 +53,8 @@ pub fn lamp_array_kind_name(kind: u32) -> &'static str {
         9 => "Furniture",
         10 => "Art",
         11 => "Headset",
-        _ => "Unknown",
+        0x100.. => "Vendor-defined",
+        _ => "Reserved",
     }
 }
 
@@ -338,9 +339,7 @@ impl<'a> LampArrayDevice<'a> {
     /// Uses the auto-increment mechanism (Section 26.8.2) to read all
     /// lamp attributes efficiently with a single request followed by
     /// sequential responses.
-    pub fn get_attributes_and_lamps(
-        &self,
-    ) -> Result<(LampArrayAttributes, Vec<LampAttributes>)> {
+    pub fn get_attributes_and_lamps(&self) -> Result<(LampArrayAttributes, Vec<LampAttributes>)> {
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
         let attrs = self.get_attributes_with_fd(&fd)?;
         let lamps = self.read_all_lamps_with_fd(&fd, attrs.lamp_count)?;
@@ -359,6 +358,20 @@ impl<'a> LampArrayDevice<'a> {
 
     fn set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
         let ctrl_info = require_report(&self.info.reports, "control")?;
+        let mut buf = vec![0u8; ctrl_info.size + 1];
+        buf[0] = ctrl_info.report_id;
+        buf[1] = if enabled { 0x01 } else { 0x00 };
+        fd.feat_set(&mut buf)
+    }
+
+    /// Try to set AutonomousMode; silently succeeds if the device has
+    /// no LampArrayControlReport (Section 26.10.1: "If this field is
+    /// absent, it means no autonomous mode is supported.").
+    fn try_set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
+        let ctrl_info = match self.info.reports.get("control") {
+            Some(info) => info,
+            None => return Ok(()),
+        };
         let mut buf = vec![0u8; ctrl_info.size + 1];
         buf[0] = ctrl_info.report_id;
         buf[1] = if enabled { 0x01 } else { 0x00 };
@@ -388,14 +401,13 @@ impl<'a> LampArrayDevice<'a> {
         let range_size = range_info.size;
 
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
-        self.set_autonomous_with_fd(&fd, false)?;
+        self.try_set_autonomous_with_fd(&fd, false)?;
 
         let attrs = self.get_attributes_with_fd(&fd)?;
-        let lamp_end = if attrs.lamp_count > 0 {
-            attrs.lamp_count - 1
-        } else {
-            0
-        };
+        if attrs.lamp_count == 0 {
+            return Ok(());
+        }
+        let lamp_end = attrs.lamp_count - 1;
 
         // Read all lamp attributes for LevelCount scaling.
         let lamps = self.read_all_lamps_with_fd(&fd, attrs.lamp_count)?;
@@ -404,16 +416,16 @@ impl<'a> LampArrayDevice<'a> {
         // RGB: min LevelCount across Programmable lamps only (Section 26.11.2:
         //   "For FixedColor Lamps, Red/Green/Blue channels are always ignored.")
         // Intensity: min across all lamps (FixedColor lamps support intensity).
-        let (max_r, max_g, max_b) = lamps
-            .iter()
-            .filter(|l| l.is_programmable)
-            .fold((255u32, 255u32, 255u32), |(mr, mg, mb), l| {
+        let (max_r, max_g, max_b) = lamps.iter().filter(|l| l.is_programmable).fold(
+            (255u32, 255u32, 255u32),
+            |(mr, mg, mb), l| {
                 (
                     mr.min(l.red_level_count as u32),
                     mg.min(l.green_level_count as u32),
                     mb.min(l.blue_level_count as u32),
                 )
-            });
+            },
+        );
         let max_i = lamps
             .iter()
             .map(|l| l.intensity_level_count as u32)
@@ -481,7 +493,7 @@ impl<'a> LampArrayDevice<'a> {
         }
 
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
-        self.set_autonomous_with_fd(&fd, false)?;
+        self.try_set_autonomous_with_fd(&fd, false)?;
 
         // Read device attributes and all lamp attributes for validation + scaling.
         let attrs = self.get_attributes_with_fd(&fd)?;
@@ -642,11 +654,7 @@ impl<'a> LedRgbDevice<'a> {
         match self.info.report_type {
             ReportType::Feature => fd.feat_set(&mut buf),
             ReportType::Output => fd.output_set(&buf),
-            ReportType::Input => {
-                // Input reports are device-to-host; writing makes no sense,
-                // but attempt Feature as a fallback.
-                fd.feat_set(&mut buf)
-            }
+            ReportType::Input => Err(Error::UnsupportedReportType),
         }
     }
 

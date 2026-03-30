@@ -581,7 +581,7 @@ fn parse_descriptor(desc: &[u8]) -> (HashMap<String, ReportInfo>, Vec<LedRgbChan
 
         match item_type {
             1 => state.handle_global(tag, val, payload), // Global
-            2 => state.handle_local(tag, val),  // Local
+            2 => state.handle_local(tag, val),           // Local
             0 => state.handle_main(tag, val), // Main (val is collection type for Collection items)
             _ => {}
         }
@@ -650,9 +650,11 @@ pub fn discover_devices() -> Vec<DeviceInfo> {
         let (lamp_reports, led_rgb_builders) = parse_descriptor(&desc_bytes);
 
         // Check for LampArray (Usage Page 0x59)
-        if !lamp_reports.is_empty()
-            && lamp_reports.contains_key("range_update")
-            && lamp_reports.contains_key("control")
+        // Minimum: attributes report + at least one update report.
+        // Control report (AutonomousMode) is optional per Section 26.10.1.
+        if lamp_reports.contains_key("attributes")
+            && (lamp_reports.contains_key("range_update")
+                || lamp_reports.contains_key("multi_update"))
         {
             devices.push(DeviceInfo::LampArray(LampArrayInfo {
                 hidraw_path: format!("/dev/{hidraw_name}"),

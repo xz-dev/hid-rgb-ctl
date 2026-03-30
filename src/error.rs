@@ -22,6 +22,8 @@ pub enum Error {
     NoAutonomousMode,
     /// The `set-lamp` command was used on a non-LampArray device.
     NoMultiUpdate,
+    /// Attempted to write to an Input-only report (device-to-host).
+    UnsupportedReportType,
     /// Invalid subcommand or argument.
     InvalidArgument(String),
     /// Wrapped I/O error.
@@ -67,6 +69,9 @@ impl fmt::Display for Error {
                     "Per-lamp color control requires a LampArray device (Usage Page 0x59) \
                      with a LampMultiUpdateReport."
                 )
+            }
+            Self::UnsupportedReportType => {
+                write!(f, "Cannot write to an Input report (device-to-host only)")
             }
             Self::InvalidArgument(msg) => {
                 write!(f, "{msg}")

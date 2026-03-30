@@ -132,9 +132,7 @@ fn cmd_get(info: &DeviceInfo) {
                         );
                         println!(
                             "  RGB levels: {}/{}/{}",
-                            lamp.red_level_count,
-                            lamp.green_level_count,
-                            lamp.blue_level_count
+                            lamp.red_level_count, lamp.green_level_count, lamp.blue_level_count
                         );
                         println!("  Intensity levels: {}", lamp.intensity_level_count);
                         println!(
