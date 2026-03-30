@@ -24,7 +24,13 @@ Linux command-line tool for controlling RGB lighting via standard HID protocols.
 - Auto-discovers devices by parsing HID report descriptors — no hardcoded
   vendor/product IDs
 - Supports preset colors, decimal RGB, hex color codes, and intensity control
+- Per-lamp color control via `set-lamp` on LampArray devices
+  (LampMultiUpdateReport with automatic batching)
 - Toggle autonomous/manual mode on LampArray devices
+- Automatic value scaling to device-declared LogicalMaximum
+  (e.g. LED Intensity 0-100 per spec)
+- Supports both Feature and Output HID report types (auto-detected from
+  descriptor)
 - Minimal dependencies — only `lexopt` (CLI parsing) and `libc` (ioctl)
 
 ## Install
@@ -58,6 +64,12 @@ hid-rgb-ctl set cyan -i 128
 
 # Turn off
 hid-rgb-ctl set off
+
+# Set per-lamp colors (LampArray only)
+hid-rgb-ctl set-lamp 0:red 1:00ff00 2:blue
+
+# Per-lamp with custom intensity
+hid-rgb-ctl set-lamp 0:ff0000 1:cyan -i 128
 
 # Specify device path (when multiple devices present)
 hid-rgb-ctl -p /dev/hidraw1 set blue
@@ -110,6 +122,17 @@ The typical operation flow (Section 26.6):
 the device has. A single-zone keyboard has `LampCount=1`; a per-key RGB
 keyboard may have 100+.
 
+Two update reports are supported:
+
+- **`LampRangeUpdateReport`** (Usage 0x60) — applies a single color to a
+  contiguous range of lamps. Used by the `set` command to set all lamps at
+  once.
+- **`LampMultiUpdateReport`** (Usage 0x50) — updates individual lamps with
+  independent colors. Used by the `set-lamp` command. Colors are automatically
+  batched based on the device's slot count (derived from report size), with
+  intermediate batches setting `LampUpdateComplete=0` and the final batch
+  setting `LampUpdateComplete=1` so the device applies all updates atomically.
+
 ### LED Page RGB (Usage Page 0x08, Section 11.7)
 
 Simpler protocol — the RGB LED collection (Usage 0x52) directly contains:
@@ -119,7 +142,19 @@ Simpler protocol — the RGB LED collection (Usage 0x52) directly contains:
 - Green LED Channel (Usage 0x55)
 - LED Intensity (Usage 0x56, optional)
 
-No autonomous mode or lamp enumeration.
+No autonomous mode or lamp enumeration. Both Feature and Output report types
+are supported (auto-detected from the descriptor). Color and intensity values
+are automatically scaled to the device's declared LogicalMaximum (the spec
+recommends logical max 100 for LED Intensity).
+
+### MinUpdateInterval
+
+LampArray devices report a `MinUpdateIntervalInMicroseconds` (visible via
+`hid-rgb-ctl get`). When performing rapid sequential updates (e.g. animation
+loops), callers should wait at least this long between updates. The spec
+requires the host to not send more than one `LampUpdateComplete` per interval.
+Since each CLI invocation is a separate process, this cannot be enforced
+automatically — scripts should add appropriate delays between calls.
 
 ## References
 

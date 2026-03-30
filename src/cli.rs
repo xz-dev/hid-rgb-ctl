@@ -191,6 +191,32 @@ fn cmd_set(info: &DeviceInfo, r: u8, g: u8, b: u8, intensity: u8) -> Result<(), 
     Ok(())
 }
 
+fn cmd_set_lamp(info: &DeviceInfo, lamps: &[(u16, String)], intensity: u8) -> Result<(), Error> {
+    match info {
+        DeviceInfo::LampArray(la_info) => {
+            let dev = LampArrayDevice::new(la_info);
+            let mut colors = Vec::with_capacity(lamps.len());
+            for (id, color_str) in lamps {
+                let rgb = match parse_color(std::slice::from_ref(color_str)) {
+                    Some(c) => c,
+                    None => {
+                        return Err(Error::InvalidArgument(format!(
+                            "Invalid color '{color_str}' for lamp {id}. \
+                             Use a preset ({}), or a 6-digit hex code.",
+                            preset_names()
+                        )));
+                    }
+                };
+                colors.push((*id, rgb.0, rgb.1, rgb.2, intensity));
+            }
+            dev.set_lamp_colors(&colors)?;
+            println!("Set {} lamp(s) on {}", colors.len(), dev.name());
+            Ok(())
+        }
+        DeviceInfo::LedRgb(_) => Err(Error::NoMultiUpdate),
+    }
+}
+
 fn cmd_auto(info: &DeviceInfo, enabled: bool) -> Result<(), Error> {
     match info {
         DeviceInfo::LampArray(la_info) => {
@@ -222,16 +248,21 @@ fn print_help() {
     eprintln!("                   If omitted, uses the first detected device.");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  list             List detected RGB devices");
-    eprintln!("  get              Show device attributes and lamp info");
-    eprintln!("  set COLOR [-i N] Set color");
-    eprintln!("  auto <on|off>    Toggle autonomous mode (LampArray only)");
+    eprintln!("  list                     List detected RGB devices");
+    eprintln!("  get                      Show device attributes and lamp info");
+    eprintln!("  set COLOR [-i N]         Set all lamps to one color");
+    eprintln!("  set-lamp ID:COLOR [...]  Set per-lamp colors (LampArray only)");
+    eprintln!("  auto <on|off>            Toggle autonomous mode (LampArray only)");
     eprintln!();
     eprintln!("Color formats:");
     eprintln!("  Preset name:     red, green, blue, white, cyan, yellow,");
     eprintln!("                   orange, purple, pink, off");
     eprintln!("  Decimal RGB:     255 165 0");
     eprintln!("  Hex code:        ff6400 or #ff6400");
+    eprintln!();
+    eprintln!("set-lamp format:");
+    eprintln!("  ID:COLOR pairs where ID is a lamp index (0-based) and COLOR");
+    eprintln!("  is a preset name or hex code. Example: 0:red 1:00ff00 2:blue");
     eprintln!();
     eprintln!("Intensity:");
     eprintln!("  -i, --intensity N  Intensity 0-255 (default: 255)");
@@ -242,13 +273,53 @@ fn print_help() {
 enum Command {
     List,
     Get,
-    Set { color: Vec<String>, intensity: u8 },
-    Auto { state: String },
+    Set {
+        color: Vec<String>,
+        intensity: u8,
+    },
+    SetLamp {
+        lamps: Vec<(u16, String)>,
+        intensity: u8,
+    },
+    Auto {
+        state: String,
+    },
 }
 
 struct Args {
     path: Option<String>,
     command: Option<Command>,
+}
+
+fn parse_set_lamp_args(
+    parser: &mut lexopt::Parser,
+) -> Result<(Vec<(u16, String)>, u8), lexopt::Error> {
+    let mut lamps = Vec::new();
+    let mut intensity = 255u8;
+
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('i') | Long("intensity") => {
+                intensity = parser.value()?.parse()?;
+            }
+            Value(val) => {
+                let s = val
+                    .into_string()
+                    .map_err(|_| "invalid UTF-8 in set-lamp argument")?;
+                // Format: ID:COLOR (e.g. "0:red", "1:ff0000")
+                let (id_str, color_str) = s
+                    .split_once(':')
+                    .ok_or("set-lamp arguments must be in ID:COLOR format (e.g. 0:red)")?;
+                let id: u16 = id_str
+                    .parse()
+                    .map_err(|_| "lamp ID must be a non-negative integer")?;
+                lamps.push((id, color_str.to_string()));
+            }
+            _ => return Err(arg.unexpected()),
+        }
+    }
+
+    Ok((lamps, intensity))
 }
 
 fn parse_set_args(parser: &mut lexopt::Parser) -> Result<(Vec<String>, u8), lexopt::Error> {
@@ -304,6 +375,10 @@ fn parse_args() -> Result<Args, Error> {
                     "set" => {
                         let (color, intensity) = parse_set_args(&mut parser)?;
                         command = Some(Command::Set { color, intensity });
+                    }
+                    "set-lamp" => {
+                        let (lamps, intensity) = parse_set_lamp_args(&mut parser)?;
+                        command = Some(Command::SetLamp { lamps, intensity });
                     }
                     "auto" => {
                         let state_val = parser.value().map_err(|_| {
@@ -396,6 +471,14 @@ pub fn run() {
                 }
             };
             cmd_set(info, rgb.0, rgb.1, rgb.2, intensity)
+        }
+        Command::SetLamp { lamps, intensity } => {
+            if lamps.is_empty() {
+                eprintln!("Error: set-lamp requires at least one ID:COLOR pair.");
+                eprintln!("Example: hid-rgb-ctl set-lamp 0:red 1:00ff00 2:blue");
+                std::process::exit(1);
+            }
+            cmd_set_lamp(info, &lamps, intensity)
         }
         Command::Auto { state } => cmd_auto(info, state == "on"),
     };

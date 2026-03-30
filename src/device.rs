@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 
-use crate::descriptor::{LampArrayInfo, LedRgbInfo, ReportInfo};
+use crate::descriptor::{LampArrayInfo, LedRgbInfo, ReportInfo, ReportType};
 use crate::error::{Error, Result};
 
 // Linux HIDRAW ioctl numbers
@@ -21,6 +21,21 @@ fn hidiocgfeature(size: usize) -> libc::c_ulong {
 
 fn hidiocsfeature(size: usize) -> libc::c_ulong {
     0xC000_4806 | ((size as libc::c_ulong) << 16)
+}
+
+/// Scale a u8 value from 0-255 range to 0-logical_max range.
+///
+/// When `logical_max` is 255, returns the input unchanged.
+/// When `logical_max` is 100 (e.g. LED Intensity per Section 11.7),
+/// scales proportionally: 255 -> 100, 128 -> 50, etc.
+fn scale_u8(value: u8, logical_max: u32) -> u8 {
+    if logical_max == 0 {
+        return 0;
+    }
+    if logical_max >= 255 {
+        return value;
+    }
+    ((value as u32 * logical_max + 127) / 255) as u8
 }
 
 /// LampArrayKind values (Section 26.2.1).
@@ -37,6 +52,7 @@ pub fn lamp_array_kind_name(kind: u32) -> &'static str {
         8 => "Wearable",
         9 => "Furniture",
         10 => "Art",
+        11 => "Headset",
         _ => "Unknown",
     }
 }
@@ -122,6 +138,16 @@ impl HidrawFd {
         if ret < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        Ok(())
+    }
+
+    /// Write a HID Output report via write() syscall.
+    ///
+    /// On Linux HIDRAW, Output reports are sent by writing directly to the fd
+    /// (as opposed to Feature reports which use ioctl).
+    fn output_set(&self, buf: &[u8]) -> Result<()> {
+        use std::io::Write;
+        (&self.fd).write_all(buf)?;
         Ok(())
     }
 }
@@ -292,6 +318,11 @@ impl<'a> LampArrayDevice<'a> {
     /// LampUpdateComplete=1 to apply immediately.
     ///
     /// Opens the fd once for the entire sequence (autonomous + attrs + update).
+    ///
+    /// Note: Callers performing rapid sequential updates should respect
+    /// the device's `min_update_interval_us` (from [`get_attributes()`])
+    /// between calls. Per Section 26.11, the spec requires no more than
+    /// one LampUpdateComplete per MinUpdateIntervalInMicroseconds.
     pub fn set_color(&self, r: u8, g: u8, b: u8, intensity: u8) -> Result<()> {
         let range_info = require_report(&self.info.reports, "range_update")?;
         let range_report_id = range_info.report_id;
@@ -331,6 +362,79 @@ impl<'a> LampArrayDevice<'a> {
         buf[9] = intensity;
 
         fd.feat_set(&mut buf)
+    }
+
+    /// Set individual lamp colors using LampMultiUpdateReport (Section 26.11.1).
+    ///
+    /// Each entry is `(lamp_id, red, green, blue, intensity)`.
+    /// Colors are batched into LampMultiUpdateReports based on the device's
+    /// slot count (derived from report size). Intermediate batches set
+    /// LampUpdateComplete=0; the final batch sets LampUpdateComplete=1
+    /// so the device applies all updates atomically.
+    ///
+    /// Requires the device descriptor to include a `multi_update` report.
+    ///
+    /// Note: Callers performing rapid sequential updates should respect
+    /// the device's `min_update_interval_us` (from [`get_attributes()`])
+    /// between calls. Per Section 26.11, the spec requires no more than
+    /// one LampUpdateComplete per MinUpdateIntervalInMicroseconds.
+    pub fn set_lamp_colors(&self, colors: &[(u16, u8, u8, u8, u8)]) -> Result<()> {
+        if colors.is_empty() {
+            return Ok(());
+        }
+
+        let multi_info = require_report(&self.info.reports, "multi_update")?;
+        let multi_report_id = multi_info.report_id;
+        let multi_size = multi_info.size;
+
+        // Derive slot count from report data size:
+        //   data = LampCount(1) + Flags(1) + N×LampId(2) + N×RGBI(4) = 2 + 6N
+        let slot_count = (multi_size.saturating_sub(2)) / 6;
+        if slot_count == 0 {
+            return Err(Error::MissingReport {
+                report_name: "multi_update (invalid size)".to_string(),
+            });
+        }
+
+        let fd = HidrawFd::open(&self.info.hidraw_path)?;
+        self.set_autonomous_with_fd(&fd, false)?;
+
+        let total_chunks = colors.chunks(slot_count).count();
+
+        for (chunk_idx, chunk) in colors.chunks(slot_count).enumerate() {
+            let is_last = chunk_idx == total_chunks - 1;
+            let mut buf = vec![0u8; multi_size + 1];
+            buf[0] = multi_report_id;
+
+            // LampMultiUpdateReport layout (Section 26.11.1, MS reference Report 4):
+            //   [ReportID, LampCount(8), LampUpdateFlags(8),
+            //    LampIds[N](16-bit LE), RGBI[N](8-bit × 4)]
+            buf[1] = chunk.len() as u8; // LampCount
+            buf[2] = if is_last { 0x01 } else { 0x00 }; // LampUpdateFlags
+
+            // Fill LampIds (16-bit LE each)
+            let ids_start = 3;
+            for (j, &(lamp_id, _, _, _, _)) in chunk.iter().enumerate() {
+                let off = ids_start + j * 2;
+                let id_bytes = lamp_id.to_le_bytes();
+                buf[off] = id_bytes[0];
+                buf[off + 1] = id_bytes[1];
+            }
+
+            // Fill RGBI tuples (4 bytes each, starting after all LampId slots)
+            let rgbi_start = ids_start + slot_count * 2;
+            for (j, &(_, r, g, b, intensity)) in chunk.iter().enumerate() {
+                let off = rgbi_start + j * 4;
+                buf[off] = r;
+                buf[off + 1] = g;
+                buf[off + 2] = b;
+                buf[off + 3] = intensity;
+            }
+
+            fd.feat_set(&mut buf)?;
+        }
+
+        Ok(())
     }
 
     /// One-line summary for CLI listing.
@@ -375,22 +479,41 @@ impl<'a> LedRgbDevice<'a> {
         &self.info.name
     }
 
-    /// Set RGB LED color via Feature report.
+    /// Set RGB LED color.
     ///
     /// Maps arguments to the correct channel offsets parsed from the descriptor.
-    /// Note the spec channel order is R(0x53), B(0x54), G(0x55) -- we handle
-    /// the mapping internally so callers always pass (r, g, b).
+    /// Values are scaled from the caller's 0-255 range to the device's
+    /// LogicalMaximum (e.g. 0-100 for intensity per Section 11.7).
+    ///
+    /// The report is sent via the appropriate mechanism for the report type
+    /// parsed from the descriptor (Feature report via ioctl, Output report
+    /// via write syscall).
     pub fn set_color(&self, r: u8, g: u8, b: u8, intensity: u8) -> Result<()> {
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
         let mut buf = vec![0u8; self.info.report_size + 1];
         buf[0] = self.info.report_id;
-        buf[1 + self.info.red_offset] = r;
-        buf[1 + self.info.blue_offset] = b;
-        buf[1 + self.info.green_offset] = g;
+
+        // Scale color channels from 0-255 to device's LogicalMaximum.
+        // When channel_logical_max == 255 this is an identity transform.
+        let lmax = self.info.channel_logical_max;
+        buf[1 + self.info.red_offset] = scale_u8(r, lmax);
+        buf[1 + self.info.blue_offset] = scale_u8(b, lmax);
+        buf[1 + self.info.green_offset] = scale_u8(g, lmax);
+
         if let Some(off) = self.info.intensity_offset {
-            buf[1 + off] = intensity;
+            let int_max = self.info.intensity_logical_max.unwrap_or(lmax);
+            buf[1 + off] = scale_u8(intensity, int_max);
         }
-        fd.feat_set(&mut buf)
+
+        match self.info.report_type {
+            ReportType::Feature => fd.feat_set(&mut buf),
+            ReportType::Output => fd.output_set(&buf),
+            ReportType::Input => {
+                // Input reports are device-to-host; writing makes no sense,
+                // but attempt Feature as a fallback.
+                fd.feat_set(&mut buf)
+            }
+        }
     }
 
     /// Return basic device info (LED Page has no LampArray-style attributes).

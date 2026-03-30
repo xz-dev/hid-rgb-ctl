@@ -14,6 +14,8 @@ pub enum Error {
     MissingReport { report_name: String },
     /// The `auto` command was used on a non-LampArray device.
     NoAutonomousMode,
+    /// The `set-lamp` command was used on a non-LampArray device.
+    NoMultiUpdate,
     /// Invalid subcommand or argument.
     InvalidArgument(String),
     /// Wrapped I/O error.
@@ -36,6 +38,13 @@ impl fmt::Display for Error {
                     f,
                     "This device does not support autonomous mode. \
                      Only LampArray (Usage Page 0x59) devices have this feature."
+                )
+            }
+            Self::NoMultiUpdate => {
+                write!(
+                    f,
+                    "Per-lamp color control requires a LampArray device (Usage Page 0x59) \
+                     with a LampMultiUpdateReport."
                 )
             }
             Self::InvalidArgument(msg) => {
