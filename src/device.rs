@@ -401,6 +401,23 @@ impl<'a> LampArrayDevice<'a> {
         self.set_autonomous_with_fd(&fd, enabled)
     }
 
+    /// Read current AutonomousMode state (Section 26.5, 26.10.1).
+    ///
+    /// Returns `true` if the device is in autonomous mode (device controls),
+    /// `false` if the host has exclusive control.
+    ///
+    /// The `LampArrayControlReport` is a Feature report, so it supports both
+    /// GET (read) and SET (write) via HIDRAW ioctl.
+    pub fn get_autonomous(&self) -> Result<bool> {
+        let ctrl_info = require_report(&self.info.reports.control, "control")?;
+        let fd = HidrawFd::open(&self.info.hidraw_path)?;
+        let buf = fd.feat_get(ctrl_info.report_id, ctrl_info.size)?;
+        // LampArrayControlReport layout (MS reference Report 6):
+        //   [ReportID(8), AutonomousMode(8)]
+        // 0 = host control, non-zero = autonomous.
+        Ok(buf.get(1).copied().unwrap_or(0) != 0)
+    }
+
     fn set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
         let ctrl_info = require_report(&self.info.reports.control, "control")?;
         let mut buf = vec![0u8; ctrl_info.size + 1];

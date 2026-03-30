@@ -214,12 +214,18 @@ fn cmd_set_lamp(info: &DeviceInfo, lamps: &[(u16, String)], intensity: u8) -> Re
     }
 }
 
-fn cmd_auto(info: &DeviceInfo, enabled: bool) -> Result<(), Error> {
+fn cmd_auto(info: &DeviceInfo, enabled: Option<bool>) -> Result<(), Error> {
     match info {
         DeviceInfo::LampArray(la_info) => {
             let dev = LampArrayDevice::new(la_info);
-            dev.set_autonomous(enabled)?;
-            let state = if enabled {
+            let current = match enabled {
+                Some(val) => {
+                    dev.set_autonomous(val)?;
+                    val
+                }
+                None => dev.get_autonomous()?,
+            };
+            let state = if current {
                 "on (device controls)"
             } else {
                 "off (host controls)"
@@ -249,7 +255,7 @@ fn print_help() {
     eprintln!("  get                      Show device attributes and lamp info");
     eprintln!("  set COLOR [-i N]         Set all lamps to one color");
     eprintln!("  set-lamp ID:COLOR [...]  Set per-lamp colors (LampArray only)");
-    eprintln!("  auto <on|off>            Toggle autonomous mode (LampArray only)");
+    eprintln!("  auto [on|off]            Query or set autonomous mode (LampArray only)");
     eprintln!();
     eprintln!("Color formats:");
     eprintln!("  Preset name:     red, green, blue, white, cyan, yellow,");
@@ -279,7 +285,7 @@ enum Command {
         intensity: u8,
     },
     Auto {
-        enabled: bool,
+        enabled: Option<bool>,
     },
 }
 
@@ -378,22 +384,24 @@ fn parse_args() -> Result<Args, Error> {
                         command = Some(Command::SetLamp { lamps, intensity });
                     }
                     "auto" => {
-                        let state_val = parser.value().map_err(|_| {
-                            Error::InvalidArgument(
-                                "auto command requires 'on' or 'off'".to_string(),
-                            )
-                        })?;
-                        let state = state_val.into_string().map_err(|_| {
-                            Error::InvalidArgument("invalid UTF-8 in auto state".to_string())
-                        })?;
-                        let enabled = match state.as_str() {
-                            "on" => true,
-                            "off" => false,
-                            _ => {
-                                return Err(Error::InvalidArgument(format!(
-                                    "auto: expected 'on' or 'off', got '{state}'"
-                                )));
+                        let enabled = match parser.optional_value() {
+                            Some(val) => {
+                                let state = val.into_string().map_err(|_| {
+                                    Error::InvalidArgument(
+                                        "invalid UTF-8 in auto state".to_string(),
+                                    )
+                                })?;
+                                Some(match state.as_str() {
+                                    "on" => true,
+                                    "off" => false,
+                                    _ => {
+                                        return Err(Error::InvalidArgument(format!(
+                                            "auto: expected 'on' or 'off', got '{state}'"
+                                        )));
+                                    }
+                                })
                             }
+                            None => None,
                         };
                         command = Some(Command::Auto { enabled });
                     }

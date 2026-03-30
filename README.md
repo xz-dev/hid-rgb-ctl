@@ -26,7 +26,7 @@ Linux command-line tool for controlling RGB lighting via standard HID protocols.
 - Supports preset colors, decimal RGB, hex color codes, and intensity control
 - Per-lamp color control via `set-lamp` on LampArray devices
   (LampMultiUpdateReport with automatic batching)
-- Toggle autonomous/manual mode on LampArray devices
+- Query and toggle autonomous/manual mode on LampArray devices
 - Automatic value scaling to device-declared LogicalMaximum
   (e.g. LED Intensity 0-100 per spec)
 - Supports both Feature and Output HID report types (auto-detected from
@@ -76,7 +76,10 @@ hid-rgb-ctl set-lamp 0:ff0000 1:cyan -i 128
 # Specify device path (when multiple devices present)
 hid-rgb-ctl -p /dev/hidraw1 set blue
 
-# Toggle autonomous mode (LampArray only)
+# Query autonomous mode (LampArray only)
+hid-rgb-ctl auto          # prints current state
+
+# Set autonomous mode
 hid-rgb-ctl auto off    # host takes control
 hid-rgb-ctl auto on     # device resumes built-in effects
 ```
