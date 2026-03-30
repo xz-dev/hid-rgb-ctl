@@ -384,8 +384,8 @@ fn parse_args() -> Result<Args, Error> {
                         command = Some(Command::SetLamp { lamps, intensity });
                     }
                     "auto" => {
-                        let enabled = match parser.optional_value() {
-                            Some(val) => {
+                        let enabled = match parser.next()? {
+                            Some(Value(val)) => {
                                 let state = val.into_string().map_err(|_| {
                                     Error::InvalidArgument(
                                         "invalid UTF-8 in auto state".to_string(),
@@ -401,6 +401,7 @@ fn parse_args() -> Result<Args, Error> {
                                     }
                                 })
                             }
+                            Some(other) => return Err(other.unexpected().into()),
                             None => None,
                         };
                         command = Some(Command::Auto { enabled });
