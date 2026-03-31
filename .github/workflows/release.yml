@@ -18,47 +18,30 @@ jobs:
         include:
           # ---- GNU targets ----
           - target: x86_64-unknown-linux-gnu
-            zig_target: x86_64-linux-gnu
           - target: i686-unknown-linux-gnu
-            zig_target: x86-linux-gnu
           - target: aarch64-unknown-linux-gnu
-            zig_target: aarch64-linux-gnu
           - target: arm-unknown-linux-gnueabihf
-            zig_target: arm-linux-gnueabihf
           - target: armv7-unknown-linux-gnueabihf
-            zig_target: arm-linux-gnueabihf
           - target: riscv64gc-unknown-linux-gnu
-            zig_target: riscv64-linux-gnu
           - target: powerpc64le-unknown-linux-gnu
-            zig_target: powerpc64le-linux-gnu
           - target: s390x-unknown-linux-gnu
-            zig_target: s390x-linux-gnu
           - target: loongarch64-unknown-linux-gnu
-            zig_target: loongarch64-linux-gnu
           # ---- musl targets (static binaries) ----
           - target: x86_64-unknown-linux-musl
-            zig_target: x86_64-linux-musl
             musl: true
           - target: i686-unknown-linux-musl
-            zig_target: x86-linux-musl
             musl: true
           - target: aarch64-unknown-linux-musl
-            zig_target: aarch64-linux-musl
             musl: true
           - target: arm-unknown-linux-musleabihf
-            zig_target: arm-linux-musleabihf
             musl: true
           - target: armv7-unknown-linux-musleabihf
-            zig_target: arm-linux-musleabihf
             musl: true
           - target: riscv64gc-unknown-linux-musl
-            zig_target: riscv64-linux-musl
             musl: true
           - target: powerpc64le-unknown-linux-musl
-            zig_target: powerpc64le-linux-musl
             musl: true
           - target: loongarch64-unknown-linux-musl
-            zig_target: loongarch64-linux-musl
             musl: true
 
     steps:
@@ -72,21 +55,8 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
 
-      - name: Configure Zig linker
-        run: |
-          # Create zig cc wrapper that filters unsupported linker flags
-          cat > /usr/local/bin/zig-cc << 'WRAPPER'
-          #!/usr/bin/env python3
-          import sys, os
-          args = [a for a in sys.argv[1:] if not a.startswith("-Wl,-melf_")]
-          os.execvp("zig", ["zig", "cc", "-target", os.environ["ZIG_TARGET"]] + args)
-          WRAPPER
-          chmod +x /usr/local/bin/zig-cc
-
-          # Set linker for this matrix target
-          TARGET_UPPER="$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
-          echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=zig-cc" >> "$GITHUB_ENV"
-          echo "ZIG_TARGET=${{ matrix.zig_target }}" >> "$GITHUB_ENV"
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
 
       - name: Build
         run: |
@@ -96,7 +66,7 @@ jobs:
           fi
           export RUSTFLAGS
 
-          cargo +nightly build \
+          cargo +nightly zigbuild \
             -Z build-std=std,panic_abort \
             --target ${{ matrix.target }} \
             --release
