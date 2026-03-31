@@ -221,6 +221,14 @@ fn cmd_auto(info: &DeviceInfo, enabled: Option<bool>) -> Result<(), Error> {
             let current = match enabled {
                 Some(val) => {
                     dev.set_autonomous(val)?;
+                    let readback = dev.get_autonomous()?;
+                    if readback != val {
+                        eprintln!(
+                            "[Warning] device reports {}, firmware may not \
+                             persist this state via feature report",
+                            if readback { "on" } else { "off" }
+                        );
+                    }
                     val
                 }
                 None => dev.get_autonomous()?,
