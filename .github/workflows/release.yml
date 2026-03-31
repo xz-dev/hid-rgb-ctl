@@ -111,7 +111,7 @@ jobs:
           ls -lh "$dst"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hid-rgb-ctl-${{ matrix.target }}
           path: hid-rgb-ctl-${{ matrix.target }}
@@ -145,7 +145,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
