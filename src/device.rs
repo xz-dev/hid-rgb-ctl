@@ -144,7 +144,7 @@ impl HidrawFd {
         let ret = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                hidiocgfeature(buf_len),
+                hidiocgfeature(buf_len) as _,
                 buf.as_mut_ptr(),
             )
         };
@@ -163,7 +163,7 @@ impl HidrawFd {
     /// Write a HID Feature report (HIDIOCSFEATURE).
     fn feat_set(&self, buf: &[u8]) -> Result<()> {
         let ret =
-            unsafe { libc::ioctl(self.fd.as_raw_fd(), hidiocsfeature(buf.len()), buf.as_ptr()) };
+            unsafe { libc::ioctl(self.fd.as_raw_fd(), hidiocsfeature(buf.len()) as _, buf.as_ptr()) };
         if ret < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
