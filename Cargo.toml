@@ -1,7 +1,7 @@
 [package]
 name = "hid-rgb-ctl"
 exclude = ["examples/*", ".github/*"]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Control RGB lighting on HID LampArray and LED Page devices on Linux"
 license = "MIT"
