@@ -23,7 +23,8 @@ hsv2rgb() {
     esac
 }
 
-trap 'echo "Stopped."; exit 0' INT TERM
+cleanup() { hid-rgb-ctl auto on 2>/dev/null; echo "Stopped. Auto mode restored."; exit 0; }
+trap cleanup INT TERM EXIT
 
 echo "Rainbow loop (step=$STEP, delay=$DELAY). Ctrl+C to stop."
 
