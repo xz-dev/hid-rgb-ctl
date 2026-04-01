@@ -250,7 +250,7 @@ impl LedRgbChannelBuilder {
 
 /// Usage entry stored during parsing -- either a plain usage ID
 /// or a pending min value awaiting a USAGE_MAX to expand the range.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum UsageEntry {
     Single(u32),
     Min(u32),
@@ -346,7 +346,7 @@ impl ParserState {
             }
             TAG_USAGE_MAX => {
                 // Expand usage range from the last USAGE_MIN
-                if let Some(UsageEntry::Min(umin)) = self.usages.last().cloned() {
+                if let Some(UsageEntry::Min(umin)) = self.usages.last().copied() {
                     self.usages.pop();
                     for u in umin..=val {
                         self.usages.push(UsageEntry::Single(u));
@@ -707,6 +707,87 @@ fn get_hid_name(hidraw: &str) -> String {
     "Unknown".to_string()
 }
 
+/// Parse a single sysfs hidraw entry into [`DeviceInfo`](s).
+///
+/// Reads the device's HID report descriptor, parses it, and returns any
+/// LampArray or LED RGB devices found. Device name and hidraw path are
+/// read/formatted only once and shared across all results.
+fn parse_hidraw_entry(sysfs_entry: &Path) -> Vec<DeviceInfo> {
+    let desc_path = sysfs_entry.join("device").join("report_descriptor");
+    let desc_bytes = match fs::read(&desc_path) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return Vec::new(),
+    };
+
+    let hidraw_name = match sysfs_entry.file_name() {
+        Some(n) => n.to_string_lossy(),
+        None => return Vec::new(),
+    };
+
+    let (lamp_reports, led_rgb_builders) = parse_descriptor(&desc_bytes);
+
+    // Check for LampArray (Usage Page 0x59)
+    // Minimum: attributes report + at least one update report.
+    // Control report (AutonomousMode) is optional per Section 26.10.1.
+    let has_lamp = lamp_reports.attributes.is_some()
+        && (lamp_reports.range_update.is_some() || lamp_reports.multi_update.is_some());
+
+    if !has_lamp && led_rgb_builders.is_empty() {
+        return Vec::new();
+    }
+
+    // Read name ONCE, build hidraw path ONCE
+    let name = get_hid_name(&hidraw_name);
+    let hidraw_path = format!("/dev/{hidraw_name}");
+    let mut devices = Vec::new();
+
+    if has_lamp {
+        devices.push(DeviceInfo::LampArray(LampArrayInfo {
+            hidraw_path: hidraw_path.clone(),
+            name: name.clone(),
+            reports: lamp_reports,
+        }));
+    }
+
+    // LED Page RGB LED (Usage Page 0x08)
+    // Builders are already filtered to is_complete() by finalize()
+    for builder in led_rgb_builders {
+        devices.push(DeviceInfo::LedRgb(LedRgbInfo {
+            hidraw_path: hidraw_path.clone(),
+            name: name.clone(),
+            report_id: builder.report_id,
+            report_size: builder.report_size,
+            red_offset: builder.red_offset.expect("guaranteed by is_complete()"),
+            blue_offset: builder.blue_offset.expect("guaranteed by is_complete()"),
+            green_offset: builder.green_offset.expect("guaranteed by is_complete()"),
+            intensity_offset: builder.intensity_offset,
+            channel_size: builder.channel_size,
+            report_type: builder.report_type,
+            red_logical_max: builder.red_logical_max,
+            green_logical_max: builder.green_logical_max,
+            blue_logical_max: builder.blue_logical_max,
+            intensity_logical_max: builder.intensity_logical_max,
+        }));
+    }
+
+    devices
+}
+
+/// Discover RGB devices at a specific hidraw path (e.g. "/dev/hidraw0").
+///
+/// Only parses the descriptor for the specified device, avoiding a full
+/// sysfs scan. Returns an empty Vec if the path is not a valid hidraw
+/// device or has no RGB capability.
+pub fn discover_device(hidraw_path: &str) -> Vec<DeviceInfo> {
+    let name = hidraw_path.rsplit('/').next().unwrap_or("");
+    let sysfs = Path::new("/sys/class/hidraw").join(name);
+    if sysfs.exists() {
+        parse_hidraw_entry(&sysfs)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Scan all hidraw devices for LampArray and LED RGB support.
 ///
 /// Reads each device's HID report descriptor from sysfs and parses it
@@ -716,75 +797,16 @@ fn get_hid_name(hidraw: &str) -> String {
 ///
 /// Returns a list of [`DeviceInfo`] objects.
 pub fn discover_devices() -> Vec<DeviceInfo> {
-    let mut devices = Vec::new();
     let hidraw_dir = Path::new("/sys/class/hidraw");
-
     if !hidraw_dir.exists() {
-        return devices;
+        return Vec::new();
     }
 
     let mut entries: Vec<_> = match fs::read_dir(hidraw_dir) {
         Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
-        Err(_) => return devices,
+        Err(_) => return Vec::new(),
     };
     entries.sort();
 
-    for entry in entries {
-        let desc_path = entry.join("device").join("report_descriptor");
-        if !desc_path.exists() {
-            continue;
-        }
-
-        let desc_bytes = match fs::read(&desc_path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-
-        if desc_bytes.is_empty() {
-            continue;
-        }
-
-        let hidraw_name = match entry.file_name() {
-            Some(n) => n.to_string_lossy().to_string(),
-            None => continue,
-        };
-
-        let (lamp_reports, led_rgb_builders) = parse_descriptor(&desc_bytes);
-
-        // Check for LampArray (Usage Page 0x59)
-        // Minimum: attributes report + at least one update report.
-        // Control report (AutonomousMode) is optional per Section 26.10.1.
-        if lamp_reports.attributes.is_some()
-            && (lamp_reports.range_update.is_some() || lamp_reports.multi_update.is_some())
-        {
-            devices.push(DeviceInfo::LampArray(LampArrayInfo {
-                hidraw_path: format!("/dev/{hidraw_name}"),
-                name: get_hid_name(&hidraw_name),
-                reports: lamp_reports,
-            }));
-        }
-
-        // Check for LED Page RGB LED (Usage Page 0x08)
-        // Builders are already filtered to is_complete() by finalize()
-        for builder in led_rgb_builders {
-            devices.push(DeviceInfo::LedRgb(LedRgbInfo {
-                hidraw_path: format!("/dev/{hidraw_name}"),
-                name: get_hid_name(&hidraw_name),
-                report_id: builder.report_id,
-                report_size: builder.report_size,
-                red_offset: builder.red_offset.expect("guaranteed by is_complete()"),
-                blue_offset: builder.blue_offset.expect("guaranteed by is_complete()"),
-                green_offset: builder.green_offset.expect("guaranteed by is_complete()"),
-                intensity_offset: builder.intensity_offset,
-                channel_size: builder.channel_size,
-                report_type: builder.report_type,
-                red_logical_max: builder.red_logical_max,
-                green_logical_max: builder.green_logical_max,
-                blue_logical_max: builder.blue_logical_max,
-                intensity_logical_max: builder.intensity_logical_max,
-            }));
-        }
-    }
-
-    devices
+    entries.iter().flat_map(|e| parse_hidraw_entry(e)).collect()
 }

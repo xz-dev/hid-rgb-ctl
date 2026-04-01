@@ -11,32 +11,40 @@ use crate::error::Error;
 
 // --- Color presets ---
 
-const PRESETS: &[(&str, (u8, u8, u8))] = &[
-    ("red", (255, 0, 0)),
-    ("green", (0, 255, 0)),
-    ("blue", (0, 0, 255)),
-    ("white", (255, 255, 255)),
-    ("cyan", (0, 255, 255)),
-    ("yellow", (255, 255, 0)),
-    ("orange", (255, 165, 0)),
-    ("purple", (128, 0, 255)),
-    ("pink", (255, 105, 180)),
-    ("off", (0, 0, 0)),
-];
+/// Join string literals with ", " at compile time.
+macro_rules! preset_names_str {
+    ($first:literal $(, $rest:literal)*) => {
+        concat!($first $(, ", ", $rest)*)
+    };
+}
 
-fn preset_names() -> String {
-    PRESETS
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Define PRESETS array and PRESET_NAMES string from a single source.
+macro_rules! define_presets {
+    ( $( $name:literal => ($r:literal, $g:literal, $b:literal) ),+ $(,)? ) => {
+        const PRESETS: &[(&str, (u8, u8, u8))] = &[
+            $( ($name, ($r, $g, $b)), )+
+        ];
+        const PRESET_NAMES: &str = preset_names_str!($($name),+);
+    };
+}
+
+define_presets! {
+    "red"    => (255, 0, 0),
+    "green"  => (0, 255, 0),
+    "blue"   => (0, 0, 255),
+    "white"  => (255, 255, 255),
+    "cyan"   => (0, 255, 255),
+    "yellow" => (255, 255, 0),
+    "orange" => (255, 165, 0),
+    "purple" => (128, 0, 255),
+    "pink"   => (255, 105, 180),
+    "off"    => (0, 0, 0),
 }
 
 fn find_preset(name: &str) -> Option<(u8, u8, u8)> {
-    let lower = name.to_lowercase();
     PRESETS
         .iter()
-        .find(|(n, _)| *n == lower)
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
         .map(|(_, rgb)| *rgb)
 }
 
@@ -174,11 +182,11 @@ fn cmd_set(info: &DeviceInfo, r: u8, g: u8, b: u8, intensity: u8) -> Result<(), 
             dev.set_color(r, g, b, intensity)?;
         }
     }
-    let mut msg = format!("Set {} to ({}, {}, {})", info.name(), r, g, b);
+    print!("Set {} to ({}, {}, {})", info.name(), r, g, b);
     if intensity != 255 {
-        msg.push_str(&format!(" intensity={intensity}"));
+        print!(" intensity={intensity}");
     }
-    println!("{msg}");
+    println!();
     Ok(())
 }
 
@@ -193,8 +201,7 @@ fn cmd_set_lamp(info: &DeviceInfo, lamps: &[(u16, String)], intensity: u8) -> Re
                     None => {
                         return Err(Error::InvalidArgument(format!(
                             "Invalid color '{color_str}' for lamp {id}. \
-                             Use a preset ({}), or a 6-digit hex code.",
-                            preset_names()
+                             Use a preset ({PRESET_NAMES}), or a 6-digit hex code."
                         )));
                     }
                 };
@@ -449,7 +456,11 @@ pub fn run() {
         }
     };
 
-    let devices = crate::descriptor::discover_devices();
+    let devices = match (&command, &args.path) {
+        // `list` always needs full scan; specific path skips full scan
+        (Command::List, _) | (_, None) => crate::descriptor::discover_devices(),
+        (_, Some(p)) => crate::descriptor::discover_device(p),
+    };
 
     if let Command::List = &command {
         cmd_list(&devices);
@@ -481,9 +492,8 @@ pub fn run() {
                 Some(c) => c,
                 None => {
                     eprintln!(
-                        "Error: Invalid color. Use a preset ({}), \
-                         R G B values (0-255), or a 6-digit hex code.",
-                        preset_names()
+                        "Error: Invalid color. Use a preset ({PRESET_NAMES}), \
+                         R G B values (0-255), or a 6-digit hex code."
                     );
                     std::process::exit(1);
                 }

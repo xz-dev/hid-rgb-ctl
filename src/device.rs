@@ -102,9 +102,9 @@ pub struct LampArrayAttributes {
 
 /// LED Page RGB device attributes (Section 11.7).
 #[derive(Debug, Clone)]
-pub struct LedRgbAttributes {
-    pub name: String,
-    pub path: String,
+pub struct LedRgbAttributes<'a> {
+    pub name: &'a str,
+    pub path: &'a str,
     pub protocol: &'static str,
     pub report_id: u8,
     pub channel_size: u32,
@@ -424,11 +424,8 @@ impl<'a> LampArrayDevice<'a> {
     }
 
     fn set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
-        let ctrl_info = require_report(&self.info.reports.control, "control")?;
-        let mut buf = vec![0u8; ctrl_info.size + 1];
-        buf[0] = ctrl_info.report_id;
-        buf[1] = if enabled { 0x01 } else { 0x00 };
-        fd.feat_set(&buf)
+        require_report(&self.info.reports.control, "control")?;
+        self.try_set_autonomous_with_fd(fd, enabled)
     }
 
     /// Try to set AutonomousMode; silently succeeds if the device has
@@ -730,10 +727,10 @@ impl<'a> LedRgbDevice<'a> {
     }
 
     /// Return basic device info (LED Page has no LampArray-style attributes).
-    pub fn get_attributes(&self) -> LedRgbAttributes {
+    pub fn get_attributes(&self) -> LedRgbAttributes<'_> {
         LedRgbAttributes {
-            name: self.info.name.clone(),
-            path: self.info.hidraw_path.clone(),
+            name: &self.info.name,
+            path: &self.info.hidraw_path,
             protocol: "LED Page RGB (Usage Page 0x08, Section 11.7)",
             report_id: self.info.report_id,
             channel_size: self.info.channel_size,
