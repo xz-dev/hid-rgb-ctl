@@ -8,7 +8,9 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 
-use crate::descriptor::{LampArrayInfo, LedRgbInfo, ReportInfo, ReportType};
+use crate::descriptor::{
+    DeviceInfo, DeviceKind, LampArrayReports, LedRgbChannelInfo, ReportInfo, ReportType,
+};
 use crate::error::{Error, Result};
 
 // Linux HIDRAW ioctl numbers
@@ -246,11 +248,12 @@ fn parse_lamp_response(buf: &[u8]) -> Result<LampAttributes> {
 ///
 /// Report IDs and sizes come from descriptor parsing, not hardcoded.
 pub struct LampArrayDevice<'a> {
-    info: &'a LampArrayInfo,
+    info: &'a DeviceInfo,
 }
 
 impl<'a> LampArrayDevice<'a> {
-    pub fn new(info: &'a LampArrayInfo) -> Self {
+    pub fn new(info: &'a DeviceInfo) -> Self {
+        debug_assert!(matches!(info.kind, DeviceKind::LampArray(_)));
         Self { info }
     }
 
@@ -264,6 +267,13 @@ impl<'a> LampArrayDevice<'a> {
         &self.info.name
     }
 
+    fn reports(&self) -> &LampArrayReports {
+        match &self.info.kind {
+            DeviceKind::LampArray(r) => r,
+            _ => unreachable!(),
+        }
+    }
+
     /// Read LampArrayAttributesReport (Section 26.2).
     ///
     /// Returns lamp count, bounding box dimensions, device kind,
@@ -274,7 +284,7 @@ impl<'a> LampArrayDevice<'a> {
     }
 
     fn get_attributes_with_fd(&self, fd: &HidrawFd) -> Result<LampArrayAttributes> {
-        let rinfo = require_report(&self.info.reports.attributes, "attributes")?;
+        let rinfo = require_report(&self.reports().attributes, "attributes")?;
         let buf = fd.feat_get(rinfo.report_id, rinfo.size)?;
 
         // Minimum size: ReportId(1) + LampCount(2) + 5×u32(20) = 23 bytes
@@ -317,15 +327,13 @@ impl<'a> LampArrayDevice<'a> {
     }
 
     fn get_lamp_with_fd(&self, fd: &HidrawFd, index: u16) -> Result<LampAttributes> {
-        let req_info = require_report(&self.info.reports.attr_request, "attr_request")?;
+        let req_info = require_report(&self.reports().attr_request, "attr_request")?;
         let mut req_buf = vec![0u8; req_info.size + 1];
         req_buf[0] = req_info.report_id;
-        let idx_bytes = index.to_le_bytes();
-        req_buf[1] = idx_bytes[0];
-        req_buf[2] = idx_bytes[1];
+        req_buf[1..3].copy_from_slice(&index.to_le_bytes());
         fd.feat_set(&req_buf)?;
 
-        let resp_info = require_report(&self.info.reports.attr_response, "attr_response")?;
+        let resp_info = require_report(&self.reports().attr_response, "attr_response")?;
         let buf = fd.feat_get(resp_info.report_id, resp_info.size)?;
         let lamp = parse_lamp_response(&buf)?;
 
@@ -359,14 +367,14 @@ impl<'a> LampArrayDevice<'a> {
         }
 
         // Send request for lamp 0 (sets device internal counter).
-        let req_info = require_report(&self.info.reports.attr_request, "attr_request")?;
+        let req_info = require_report(&self.reports().attr_request, "attr_request")?;
         let mut req_buf = vec![0u8; req_info.size + 1];
         req_buf[0] = req_info.report_id;
         // LampId = 0 (already zeroed)
         fd.feat_set(&req_buf)?;
 
         // Read lamp_count responses; device auto-increments after each.
-        let resp_info = require_report(&self.info.reports.attr_response, "attr_response")?;
+        let resp_info = require_report(&self.reports().attr_response, "attr_response")?;
         let mut lamps = Vec::with_capacity(lamp_count as usize);
 
         for expected_id in 0..lamp_count {
@@ -414,7 +422,7 @@ impl<'a> LampArrayDevice<'a> {
     /// The `LampArrayControlReport` is a Feature report, so it supports both
     /// GET (read) and SET (write) via HIDRAW ioctl.
     pub fn get_autonomous(&self) -> Result<bool> {
-        let ctrl_info = require_report(&self.info.reports.control, "control")?;
+        let ctrl_info = require_report(&self.reports().control, "control")?;
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
         let buf = fd.feat_get(ctrl_info.report_id, ctrl_info.size)?;
         // LampArrayControlReport layout (MS reference Report 6):
@@ -424,7 +432,7 @@ impl<'a> LampArrayDevice<'a> {
     }
 
     fn set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
-        require_report(&self.info.reports.control, "control")?;
+        require_report(&self.reports().control, "control")?;
         self.try_set_autonomous_with_fd(fd, enabled)
     }
 
@@ -432,7 +440,7 @@ impl<'a> LampArrayDevice<'a> {
     /// no LampArrayControlReport (Section 26.10.1: "If this field is
     /// absent, it means no autonomous mode is supported.").
     fn try_set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
-        let ctrl_info = match &self.info.reports.control {
+        let ctrl_info = match &self.reports().control {
             Some(info) => info,
             None => return Ok(()),
         };
@@ -460,7 +468,7 @@ impl<'a> LampArrayDevice<'a> {
     /// between calls. Per Section 26.11, the spec requires no more than
     /// one LampUpdateComplete per MinUpdateIntervalInMicroseconds.
     pub fn set_color(&self, r: u8, g: u8, b: u8, intensity: u8) -> Result<()> {
-        let range_info = require_report(&self.info.reports.range_update, "range_update")?;
+        let range_info = require_report(&self.reports().range_update, "range_update")?;
         let range_report_id = range_info.report_id;
         let range_size = range_info.size;
 
@@ -502,12 +510,8 @@ impl<'a> LampArrayDevice<'a> {
         let mut buf = vec![0u8; range_size + 1];
         buf[0] = range_report_id;
         buf[1] = 0x01; // LampUpdateFlags: bit 0 = LampUpdateComplete
-        let start_bytes = 0u16.to_le_bytes();
-        buf[2] = start_bytes[0];
-        buf[3] = start_bytes[1];
-        let end_bytes = lamp_end.to_le_bytes();
-        buf[4] = end_bytes[0];
-        buf[5] = end_bytes[1];
+        buf[2..4].copy_from_slice(&0u16.to_le_bytes());
+        buf[4..6].copy_from_slice(&lamp_end.to_le_bytes());
         buf[6] = scale_u8(r, max_r);
         buf[7] = scale_u8(g, max_g);
         buf[8] = scale_u8(b, max_b);
@@ -543,7 +547,7 @@ impl<'a> LampArrayDevice<'a> {
             return Ok(());
         }
 
-        let multi_info = require_report(&self.info.reports.multi_update, "multi_update")?;
+        let multi_info = require_report(&self.reports().multi_update, "multi_update")?;
         let multi_report_id = multi_info.report_id;
         let multi_size = multi_info.size;
 
@@ -627,9 +631,7 @@ impl<'a> LampArrayDevice<'a> {
             let ids_start = 3;
             for (j, c) in chunk.iter().enumerate() {
                 let off = ids_start + j * 2;
-                let id_bytes = c.lamp_id.to_le_bytes();
-                buf[off] = id_bytes[0];
-                buf[off + 1] = id_bytes[1];
+                buf[off..off + 2].copy_from_slice(&c.lamp_id.to_le_bytes());
             }
 
             // Fill RGBI tuples (4 bytes each, starting after all LampId slots)
@@ -653,8 +655,9 @@ impl<'a> LampArrayDevice<'a> {
     /// Returns a static description based on descriptor info only — does not
     /// open the device or perform any ioctl calls.
     pub fn summary(&self) -> &'static str {
-        let has_range = self.info.reports.range_update.is_some();
-        let has_multi = self.info.reports.multi_update.is_some();
+        let reports = self.reports();
+        let has_range = reports.range_update.is_some();
+        let has_multi = reports.multi_update.is_some();
         match (has_range, has_multi) {
             (true, true) => "LampArray (range+multi update)",
             (true, false) => "LampArray (range update)",
@@ -676,11 +679,12 @@ impl<'a> LampArrayDevice<'a> {
 ///
 /// Byte offsets are determined by descriptor parsing, not assumed.
 pub struct LedRgbDevice<'a> {
-    info: &'a LedRgbInfo,
+    info: &'a DeviceInfo,
 }
 
 impl<'a> LedRgbDevice<'a> {
-    pub fn new(info: &'a LedRgbInfo) -> Self {
+    pub fn new(info: &'a DeviceInfo) -> Self {
+        debug_assert!(matches!(info.kind, DeviceKind::LedRgb(_)));
         Self { info }
     }
 
@@ -694,6 +698,13 @@ impl<'a> LedRgbDevice<'a> {
         &self.info.name
     }
 
+    fn channels(&self) -> &LedRgbChannelInfo {
+        match &self.info.kind {
+            DeviceKind::LedRgb(c) => c,
+            _ => unreachable!(),
+        }
+    }
+
     /// Set RGB LED color.
     ///
     /// Maps arguments to the correct channel offsets parsed from the descriptor.
@@ -704,22 +715,23 @@ impl<'a> LedRgbDevice<'a> {
     /// parsed from the descriptor (Feature report via ioctl, Output report
     /// via write syscall).
     pub fn set_color(&self, r: u8, g: u8, b: u8, intensity: u8) -> Result<()> {
+        let ch = self.channels();
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
-        let mut buf = vec![0u8; self.info.report_size + 1];
-        buf[0] = self.info.report_id;
+        let mut buf = vec![0u8; ch.report_size + 1];
+        buf[0] = ch.report_id;
 
         // Scale color channels from 0-255 to each channel's LogicalMaximum.
         // When logical_max == 255 this is an identity transform.
-        buf[1 + self.info.red_offset] = scale_u8(r, self.info.red_logical_max);
-        buf[1 + self.info.blue_offset] = scale_u8(b, self.info.blue_logical_max);
-        buf[1 + self.info.green_offset] = scale_u8(g, self.info.green_logical_max);
+        buf[1 + ch.red_offset] = scale_u8(r, ch.red_logical_max);
+        buf[1 + ch.blue_offset] = scale_u8(b, ch.blue_logical_max);
+        buf[1 + ch.green_offset] = scale_u8(g, ch.green_logical_max);
 
-        if let Some(off) = self.info.intensity_offset {
-            let int_max = self.info.intensity_logical_max.unwrap_or(255);
+        if let Some(off) = ch.intensity_offset {
+            let int_max = ch.intensity_logical_max.unwrap_or(255);
             buf[1 + off] = scale_u8(intensity, int_max);
         }
 
-        match self.info.report_type {
+        match ch.report_type {
             ReportType::Feature => fd.feat_set(&buf),
             ReportType::Output => fd.output_set(&buf),
             ReportType::Input => Err(Error::UnsupportedReportType),
@@ -728,13 +740,14 @@ impl<'a> LedRgbDevice<'a> {
 
     /// Return basic device info (LED Page has no LampArray-style attributes).
     pub fn get_attributes(&self) -> LedRgbAttributes<'_> {
+        let ch = self.channels();
         LedRgbAttributes {
             name: &self.info.name,
             path: &self.info.hidraw_path,
             protocol: "LED Page RGB (Usage Page 0x08, Section 11.7)",
-            report_id: self.info.report_id,
-            channel_size: self.info.channel_size,
-            has_intensity: self.info.intensity_offset.is_some(),
+            report_id: ch.report_id,
+            channel_size: ch.channel_size,
+            has_intensity: ch.intensity_offset.is_some(),
         }
     }
 

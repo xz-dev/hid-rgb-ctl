@@ -5,7 +5,7 @@
 
 use lexopt::prelude::*;
 
-use crate::descriptor::DeviceInfo;
+use crate::descriptor::{DeviceInfo, DeviceKind};
 use crate::device::{LampArrayDevice, LampColor, LedRgbDevice};
 use crate::error::Error;
 
@@ -90,7 +90,7 @@ fn find_device<'a>(devices: &'a [DeviceInfo], path: Option<&str>) -> Option<&'a 
     }
     match path {
         None => Some(&devices[0]),
-        Some(p) => devices.iter().find(|d| d.hidraw_path() == p),
+        Some(p) => devices.iter().find(|d| d.hidraw_path == p),
     }
 }
 
@@ -103,18 +103,18 @@ fn cmd_list(devices: &[DeviceInfo]) {
     }
 
     for d in devices {
-        let summary = match d {
-            DeviceInfo::LampArray(info) => LampArrayDevice::new(info).summary(),
-            DeviceInfo::LedRgb(info) => LedRgbDevice::new(info).summary(),
+        let summary = match &d.kind {
+            DeviceKind::LampArray(_) => LampArrayDevice::new(d).summary(),
+            DeviceKind::LedRgb(_) => LedRgbDevice::new(d).summary(),
         };
-        println!("{}  {}  {}", d.hidraw_path(), d.name(), summary);
+        println!("{}  {}  {}", d.hidraw_path, d.name, summary);
     }
 }
 
 fn cmd_get(info: &DeviceInfo) {
-    match info {
-        DeviceInfo::LampArray(la_info) => {
-            let dev = LampArrayDevice::new(la_info);
+    match &info.kind {
+        DeviceKind::LampArray(_) => {
+            let dev = LampArrayDevice::new(info);
             match dev.get_attributes_and_lamps() {
                 Ok((attrs, lamps)) => {
                     println!("Device: {}", dev.name());
@@ -155,8 +155,8 @@ fn cmd_get(info: &DeviceInfo) {
                 }
             }
         }
-        DeviceInfo::LedRgb(rgb_info) => {
-            let dev = LedRgbDevice::new(rgb_info);
+        DeviceKind::LedRgb(_) => {
+            let dev = LedRgbDevice::new(info);
             let attrs = dev.get_attributes();
             println!("Device: {}", attrs.name);
             println!("Protocol: {}", attrs.protocol);
@@ -172,17 +172,17 @@ fn cmd_get(info: &DeviceInfo) {
 }
 
 fn cmd_set(info: &DeviceInfo, r: u8, g: u8, b: u8, intensity: u8) -> Result<(), Error> {
-    match info {
-        DeviceInfo::LampArray(la_info) => {
-            let dev = LampArrayDevice::new(la_info);
+    match &info.kind {
+        DeviceKind::LampArray(_) => {
+            let dev = LampArrayDevice::new(info);
             dev.set_color(r, g, b, intensity)?;
         }
-        DeviceInfo::LedRgb(rgb_info) => {
-            let dev = LedRgbDevice::new(rgb_info);
+        DeviceKind::LedRgb(_) => {
+            let dev = LedRgbDevice::new(info);
             dev.set_color(r, g, b, intensity)?;
         }
     }
-    print!("Set {} to ({}, {}, {})", info.name(), r, g, b);
+    print!("Set {} to ({}, {}, {})", info.name, r, g, b);
     if intensity != 255 {
         print!(" intensity={intensity}");
     }
@@ -191,9 +191,9 @@ fn cmd_set(info: &DeviceInfo, r: u8, g: u8, b: u8, intensity: u8) -> Result<(), 
 }
 
 fn cmd_set_lamp(info: &DeviceInfo, lamps: &[(u16, String)], intensity: u8) -> Result<(), Error> {
-    match info {
-        DeviceInfo::LampArray(la_info) => {
-            let dev = LampArrayDevice::new(la_info);
+    match &info.kind {
+        DeviceKind::LampArray(_) => {
+            let dev = LampArrayDevice::new(info);
             let mut colors = Vec::with_capacity(lamps.len());
             for (id, color_str) in lamps {
                 let rgb = match parse_color(std::slice::from_ref(color_str)) {
@@ -217,14 +217,14 @@ fn cmd_set_lamp(info: &DeviceInfo, lamps: &[(u16, String)], intensity: u8) -> Re
             println!("Set {} lamp(s) on {}", colors.len(), dev.name());
             Ok(())
         }
-        DeviceInfo::LedRgb(_) => Err(Error::NoMultiUpdate),
+        DeviceKind::LedRgb(_) => Err(Error::NoMultiUpdate),
     }
 }
 
 fn cmd_auto(info: &DeviceInfo, enabled: Option<bool>) -> Result<(), Error> {
-    match info {
-        DeviceInfo::LampArray(la_info) => {
-            let dev = LampArrayDevice::new(la_info);
+    match &info.kind {
+        DeviceKind::LampArray(_) => {
+            let dev = LampArrayDevice::new(info);
             let current = match enabled {
                 Some(val) => {
                     dev.set_autonomous(val)?;
@@ -248,7 +248,7 @@ fn cmd_auto(info: &DeviceInfo, enabled: Option<bool>) -> Result<(), Error> {
             println!("Autonomous mode: {state}");
             Ok(())
         }
-        DeviceInfo::LedRgb(_) => Err(Error::NoAutonomousMode),
+        DeviceKind::LedRgb(_) => Err(Error::NoAutonomousMode),
     }
 }
 

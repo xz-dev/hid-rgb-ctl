@@ -127,18 +127,7 @@ pub struct LampArrayReports {
     pub control: Option<ReportInfo>,
 }
 
-/// Device implementing HID LampArray (Usage Page 0x59).
-///
-/// Report IDs and sizes are parsed from the device's HID report descriptor,
-/// not hardcoded, so this works with any compliant LampArray device.
-#[derive(Debug, Clone)]
-pub struct LampArrayInfo {
-    pub hidraw_path: String,
-    pub name: String,
-    pub reports: LampArrayReports,
-}
-
-/// Device implementing LED Page RGB LED (Usage Page 0x08, Section 11.7).
+/// LED Page RGB channel layout (Usage Page 0x08, Section 11.7).
 ///
 /// The RGB LED collection (Usage 0x52) contains:
 ///   - Red LED Channel (Usage 0x53)
@@ -148,9 +137,7 @@ pub struct LampArrayInfo {
 ///
 /// Byte offsets are parsed from the descriptor to handle any report layout.
 #[derive(Debug, Clone)]
-pub struct LedRgbInfo {
-    pub hidraw_path: String,
-    pub name: String,
+pub struct LedRgbChannelInfo {
     pub report_id: u8,
     /// Total data bytes (excluding report ID).
     pub report_size: usize,
@@ -175,29 +162,24 @@ pub struct LedRgbInfo {
     pub intensity_logical_max: Option<u32>,
 }
 
-/// Either a LampArray or LED RGB device info.
+/// Type-specific device data.
 #[derive(Debug, Clone)]
-pub enum DeviceInfo {
-    LampArray(LampArrayInfo),
-    LedRgb(LedRgbInfo),
+pub enum DeviceKind {
+    /// HID LampArray (Usage Page 0x59).
+    LampArray(LampArrayReports),
+    /// LED Page RGB LED (Usage Page 0x08, Section 11.7).
+    LedRgb(LedRgbChannelInfo),
 }
 
-impl DeviceInfo {
-    /// The hidraw device path (e.g. `/dev/hidraw0`).
-    pub fn hidraw_path(&self) -> &str {
-        match self {
-            Self::LampArray(info) => &info.hidraw_path,
-            Self::LedRgb(info) => &info.hidraw_path,
-        }
-    }
-
-    /// The device name from sysfs.
-    pub fn name(&self) -> &str {
-        match self {
-            Self::LampArray(info) => &info.name,
-            Self::LedRgb(info) => &info.name,
-        }
-    }
+/// Discovered HID RGB device.
+///
+/// Common fields (path, name) are stored directly; type-specific data
+/// lives in the [`DeviceKind`] enum.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub hidraw_path: String,
+    pub name: String,
+    pub kind: DeviceKind,
 }
 
 // --- HID Report Descriptor Parser ---
@@ -242,6 +224,13 @@ impl Default for LedRgbChannelBuilder {
 }
 
 impl LedRgbChannelBuilder {
+    fn with_report_id(report_id: u8) -> Self {
+        Self {
+            report_id,
+            ..Self::default()
+        }
+    }
+
     /// True when all mandatory channels (R, G, B) have been found.
     fn is_complete(&self) -> bool {
         self.red_offset.is_some() && self.blue_offset.is_some() && self.green_offset.is_some()
@@ -275,21 +264,19 @@ struct ParserState {
 
     // Accumulated results
     lamp_array_reports: LampArrayReports,
-    led_rgb_channels: Vec<(u8, LedRgbChannelBuilder)>,
+    led_rgb_channels: Vec<LedRgbChannelBuilder>,
 
     // Per-report accumulated data bits for final size calculation
     report_data_bits: Vec<(u8, u32)>,
 
     // Collection / context tracking
     collection_depth: u32,
-    current_lighting_report_kind: Option<LampArrayReportKind>,
-    in_rgb_led_collection: bool,
-    /// Whether we are inside a LampArray Application collection (Usage Page 0x59, Usage 0x01).
-    in_lamp_array_app: bool,
 
     // Depth at which each context flag was set (for precise end-collection reset).
+    // `is_some()` replaces the former `in_*` boolean flags (single source of truth).
     lamp_array_app_depth: Option<u32>,
-    lighting_report_depth: Option<u32>,
+    /// (depth, kind) — replaces the former separate depth + kind fields.
+    lighting_report: Option<(u32, LampArrayReportKind)>,
     rgb_led_collection_depth: Option<u32>,
 }
 
@@ -308,11 +295,8 @@ impl ParserState {
             led_rgb_channels: Vec::new(),
             report_data_bits: Vec::new(),
             collection_depth: 0,
-            current_lighting_report_kind: None,
-            in_rgb_led_collection: false,
-            in_lamp_array_app: false,
             lamp_array_app_depth: None,
-            lighting_report_depth: None,
+            lighting_report: None,
             rgb_led_collection_depth: None,
         }
     }
@@ -368,50 +352,52 @@ impl ParserState {
         }
     }
 
+    /// Check if the current usage list contains a specific usage ID.
+    fn has_usage(&self, target: u32) -> bool {
+        self.usages
+            .iter()
+            .any(|e| matches!(e, UsageEntry::Single(u) if *u == target))
+    }
+
+    /// Find the first matching usage and transform it via `f`.
+    fn find_usage_map<T>(&self, f: impl Fn(u32) -> Option<T>) -> Option<T> {
+        self.usages.iter().find_map(|e| match e {
+            UsageEntry::Single(u) => f(*u),
+            _ => None,
+        })
+    }
+
     fn on_collection(&mut self, collection_type: u32) {
         self.collection_depth += 1;
 
         // LampArray Application collection (Usage Page 0x59, Usage 0x01)
-        if self.usage_page == USAGE_PAGE_LIGHTING && collection_type == COLLECTION_APPLICATION {
-            for entry in &self.usages {
-                if let UsageEntry::Single(usage) = entry {
-                    if *usage == USAGE_LAMP_ARRAY {
-                        self.in_lamp_array_app = true;
-                        self.lamp_array_app_depth = Some(self.collection_depth);
-                    }
-                }
-            }
+        if self.usage_page == USAGE_PAGE_LIGHTING
+            && collection_type == COLLECTION_APPLICATION
+            && self.has_usage(USAGE_LAMP_ARRAY)
+        {
+            self.lamp_array_app_depth = Some(self.collection_depth);
         }
 
         // LampArray sub-report collections: only match inside a LampArray app collection
-        if self.usage_page == USAGE_PAGE_LIGHTING && self.in_lamp_array_app {
-            for entry in &self.usages {
-                if let UsageEntry::Single(usage) = entry {
-                    if let Some(kind) = LampArrayReportKind::from_usage(*usage) {
-                        self.current_lighting_report_kind = Some(kind);
-                        self.lighting_report_depth = Some(self.collection_depth);
-                    }
-                }
+        if self.usage_page == USAGE_PAGE_LIGHTING && self.lamp_array_app_depth.is_some() {
+            if let Some(kind) = self.find_usage_map(LampArrayReportKind::from_usage) {
+                self.lighting_report = Some((self.collection_depth, kind));
             }
         }
 
         // RGB LED collection: per Section 11.7, RGB LED is a Logical collection (CL)
-        if self.usage_page == USAGE_PAGE_LED && collection_type == COLLECTION_LOGICAL {
-            for entry in &self.usages {
-                if let UsageEntry::Single(usage) = entry {
-                    if *usage == USAGE_RGB_LED {
-                        self.in_rgb_led_collection = true;
-                        self.rgb_led_collection_depth = Some(self.collection_depth);
-                        if !self
-                            .led_rgb_channels
-                            .iter()
-                            .any(|(rid, _)| *rid == self.report_id)
-                        {
-                            self.led_rgb_channels
-                                .push((self.report_id, LedRgbChannelBuilder::default()));
-                        }
-                    }
-                }
+        if self.usage_page == USAGE_PAGE_LED
+            && collection_type == COLLECTION_LOGICAL
+            && self.has_usage(USAGE_RGB_LED)
+        {
+            self.rgb_led_collection_depth = Some(self.collection_depth);
+            if !self
+                .led_rgb_channels
+                .iter()
+                .any(|b| b.report_id == self.report_id)
+            {
+                self.led_rgb_channels
+                    .push(LedRgbChannelBuilder::with_report_id(self.report_id));
             }
         }
 
@@ -420,16 +406,16 @@ impl ParserState {
 
     fn on_end_collection(&mut self) {
         // Check BEFORE decrementing — we are leaving the collection at this depth.
-        if Some(self.collection_depth) == self.lighting_report_depth {
-            self.current_lighting_report_kind = None;
-            self.lighting_report_depth = None;
+        if self
+            .lighting_report
+            .is_some_and(|(d, _)| d == self.collection_depth)
+        {
+            self.lighting_report = None;
         }
-        if Some(self.collection_depth) == self.rgb_led_collection_depth {
-            self.in_rgb_led_collection = false;
+        if self.rgb_led_collection_depth == Some(self.collection_depth) {
             self.rgb_led_collection_depth = None;
         }
-        if Some(self.collection_depth) == self.lamp_array_app_depth {
-            self.in_lamp_array_app = false;
+        if self.lamp_array_app_depth == Some(self.collection_depth) {
             self.lamp_array_app_depth = None;
         }
         self.collection_depth = self.collection_depth.saturating_sub(1);
@@ -461,7 +447,7 @@ impl ParserState {
 
         // Lighting Page (0x59): record report info
         if self.usage_page == USAGE_PAGE_LIGHTING {
-            if let Some(kind) = self.current_lighting_report_kind {
+            if let Some((_, kind)) = self.lighting_report {
                 let rinfo = ReportInfo {
                     report_id: rid,
                     size: 0,
@@ -481,13 +467,17 @@ impl ParserState {
         }
 
         // LED Page (0x08): record channel byte offsets (absolute within report)
-        if self.usage_page == USAGE_PAGE_LED && self.in_rgb_led_collection {
-            let builder = match self.led_rgb_channels.iter_mut().find(|(r, _)| *r == rid) {
-                Some((_, b)) => b,
+        if self.usage_page == USAGE_PAGE_LED && self.rgb_led_collection_depth.is_some() {
+            let builder = match self
+                .led_rgb_channels
+                .iter_mut()
+                .find(|b| b.report_id == rid)
+            {
+                Some(b) => b,
                 None => {
                     self.led_rgb_channels
-                        .push((rid, LedRgbChannelBuilder::default()));
-                    &mut self.led_rgb_channels.last_mut().unwrap().1
+                        .push(LedRgbChannelBuilder::with_report_id(rid));
+                    self.led_rgb_channels.last_mut().unwrap()
                 }
             };
             builder.report_type = report_type;
@@ -564,10 +554,9 @@ impl ParserState {
         let complete = self
             .led_rgb_channels
             .into_iter()
-            .filter_map(|(rid, mut builder)| {
+            .filter_map(|mut builder| {
                 if builder.is_complete() {
-                    builder.report_id = rid;
-                    builder.report_size = bits_for(rid).div_ceil(8) as usize;
+                    builder.report_size = bits_for(builder.report_id).div_ceil(8) as usize;
                     Some(builder)
                 } else {
                     None
@@ -742,32 +731,34 @@ fn parse_hidraw_entry(sysfs_entry: &Path) -> Vec<DeviceInfo> {
     let mut devices = Vec::new();
 
     if has_lamp {
-        devices.push(DeviceInfo::LampArray(LampArrayInfo {
+        devices.push(DeviceInfo {
             hidraw_path: hidraw_path.clone(),
             name: name.clone(),
-            reports: lamp_reports,
-        }));
+            kind: DeviceKind::LampArray(lamp_reports),
+        });
     }
 
     // LED Page RGB LED (Usage Page 0x08)
     // Builders are already filtered to is_complete() by finalize()
     for builder in led_rgb_builders {
-        devices.push(DeviceInfo::LedRgb(LedRgbInfo {
+        devices.push(DeviceInfo {
             hidraw_path: hidraw_path.clone(),
             name: name.clone(),
-            report_id: builder.report_id,
-            report_size: builder.report_size,
-            red_offset: builder.red_offset.expect("guaranteed by is_complete()"),
-            blue_offset: builder.blue_offset.expect("guaranteed by is_complete()"),
-            green_offset: builder.green_offset.expect("guaranteed by is_complete()"),
-            intensity_offset: builder.intensity_offset,
-            channel_size: builder.channel_size,
-            report_type: builder.report_type,
-            red_logical_max: builder.red_logical_max,
-            green_logical_max: builder.green_logical_max,
-            blue_logical_max: builder.blue_logical_max,
-            intensity_logical_max: builder.intensity_logical_max,
-        }));
+            kind: DeviceKind::LedRgb(LedRgbChannelInfo {
+                report_id: builder.report_id,
+                report_size: builder.report_size,
+                red_offset: builder.red_offset.expect("guaranteed by is_complete()"),
+                blue_offset: builder.blue_offset.expect("guaranteed by is_complete()"),
+                green_offset: builder.green_offset.expect("guaranteed by is_complete()"),
+                intensity_offset: builder.intensity_offset,
+                channel_size: builder.channel_size,
+                report_type: builder.report_type,
+                red_logical_max: builder.red_logical_max,
+                green_logical_max: builder.green_logical_max,
+                blue_logical_max: builder.blue_logical_max,
+                intensity_logical_max: builder.intensity_logical_max,
+            }),
+        });
     }
 
     devices

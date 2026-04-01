@@ -8,17 +8,17 @@
 //! # Example
 //!
 //! ```no_run
-//! use hid_rgb_ctl::{discover_devices, DeviceInfo, LampArrayDevice, LedRgbDevice};
+//! use hid_rgb_ctl::{discover_devices, DeviceKind, LampArrayDevice, LedRgbDevice};
 //!
 //! let devices = discover_devices();
 //! for dev in &devices {
-//!     match dev {
-//!         DeviceInfo::LampArray(info) => {
-//!             let device = LampArrayDevice::new(info);
+//!     match &dev.kind {
+//!         DeviceKind::LampArray(_) => {
+//!             let device = LampArrayDevice::new(dev);
 //!             device.set_color(255, 0, 0, 255).unwrap();
 //!         }
-//!         DeviceInfo::LedRgb(info) => {
-//!             let device = LedRgbDevice::new(info);
+//!         DeviceKind::LedRgb(_) => {
+//!             let device = LedRgbDevice::new(dev);
 //!             device.set_color(255, 0, 0, 255).unwrap();
 //!         }
 //!     }
@@ -32,7 +32,7 @@ pub mod device;
 pub mod error;
 
 pub use descriptor::{
-    discover_device, discover_devices, DeviceInfo, LampArrayInfo, LampArrayReports, LedRgbInfo,
+    discover_device, discover_devices, DeviceInfo, DeviceKind, LampArrayReports, LedRgbChannelInfo,
     ReportInfo, ReportType,
 };
 pub use device::{LampArrayAttributes, LampArrayDevice, LampAttributes, LampColor, LedRgbDevice};
