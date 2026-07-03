@@ -6,4 +6,4 @@
 # Cargo.lock
 
 # Local pi agent state
-/.pi/
+.pi/

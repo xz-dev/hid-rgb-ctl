@@ -3,34 +3,22 @@
 Linux command-line tool for controlling RGB lighting via standard HID protocols.
 
 > [!NOTE]
-> This project was built with **vibe coding**. Contributions via vibe coding
-> are welcome — don't worry too much about code style, just make it work.
+> This project was built with **vibe coding**. Contributions via vibe coding are welcome — don't worry too much about code style, just make it work.
 
 ## Supported Protocols
 
-- **HID LampArray** (Usage Page 0x59) — Modern
-  [Dynamic Lighting](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/dynamic-lighting-devices)
-  standard from the
-  [USB HID Usage Tables v1.4](https://usb.org/document-library/hid-usage-tables-14)
-  (Section 26). Supports device interrogation, per-lamp attributes,
-  autonomous/manual mode, and color updates.
+- **HID LampArray** (Usage Page 0x59) — Modern [Dynamic Lighting](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/dynamic-lighting-devices) standard from the [USB HID Usage Tables v1.4](https://usb.org/document-library/hid-usage-tables-14) (Section 26). Supports device interrogation, per-lamp attributes, autonomous/manual mode, and color updates.
 
-- **HID LED Page RGB** (Usage Page 0x08, Usage 0x52) — Legacy RGB LED control
-  per HID Usage Tables Section 11.7. Simpler protocol with direct R/B/G
-  channel writes.
+- **HID LED Page RGB** (Usage Page 0x08, Usage 0x52) — Legacy RGB LED control per HID Usage Tables Section 11.7. Simpler protocol with direct R/B/G channel writes.
 
 ## Features
 
-- Auto-discovers devices by parsing HID report descriptors — no hardcoded
-  vendor/product IDs
+- Auto-discovers devices by parsing HID report descriptors — no hardcoded vendor/product IDs
 - Supports preset colors, decimal RGB, hex color codes, and intensity control
-- Per-lamp color control via `set-lamp` on LampArray devices
-  (LampMultiUpdateReport with automatic batching)
+- Per-lamp color control via `set-lamp` on LampArray devices (LampMultiUpdateReport with automatic batching)
 - Query and toggle autonomous/manual mode on LampArray devices
-- Automatic value scaling to device-declared LogicalMaximum
-  (e.g. LED Intensity 0-100 per spec)
-- Supports both Feature and Output HID report types (auto-detected from
-  descriptor)
+- Automatic value scaling to device-declared LogicalMaximum (e.g. LED Intensity 0-100 per spec)
+- Supports both Feature and Output HID report types (auto-detected from descriptor)
 - Minimal dependencies — only `lexopt` (CLI parsing) and `libc` (ioctl)
 
 ## Install
@@ -84,8 +72,7 @@ hid-rgb-ctl auto off    # host takes control
 hid-rgb-ctl auto on     # device resumes built-in effects
 ```
 
-Color presets: `red`, `green`, `blue`, `white`, `cyan`, `yellow`, `orange`,
-`purple`, `pink`, `off`
+Color presets: `red`, `green`, `blue`, `white`, `cyan`, `yellow`, `orange`, `purple`, `pink`, `off`
 
 ## Permissions
 
@@ -130,26 +117,17 @@ Contributions welcome — please open an issue or PR with your device info.
 The typical operation flow (Section 26.6):
 
 1. Read `LampArrayAttributesReport` — get lamp count, device kind
-2. Read `LampAttributesResponseReport` for each lamp — get position, RGB
-   level counts, programmability
+2. Read `LampAttributesResponseReport` for each lamp — get position, RGB level counts, programmability
 3. Disable `AutonomousMode` — take control from device firmware
 4. Send `LampRangeUpdateReport` or `LampMultiUpdateReport` with color data
 5. Re-enable `AutonomousMode` when done (optional)
 
-`LampCount` (Usage 0x03) tells you how many independently controllable zones
-the device has. A single-zone keyboard has `LampCount=1`; a per-key RGB
-keyboard may have 100+.
+`LampCount` (Usage 0x03) tells you how many independently controllable zones the device has. A single-zone keyboard has `LampCount=1`; a per-key RGB keyboard may have 100+.
 
 Two update reports are supported:
 
-- **`LampRangeUpdateReport`** (Usage 0x60) — applies a single color to a
-  contiguous range of lamps. Used by the `set` command to set all lamps at
-  once.
-- **`LampMultiUpdateReport`** (Usage 0x50) — updates individual lamps with
-  independent colors. Used by the `set-lamp` command. Colors are automatically
-  batched based on the device's slot count (derived from report size), with
-  intermediate batches setting `LampUpdateComplete=0` and the final batch
-  setting `LampUpdateComplete=1` so the device applies all updates atomically.
+- **`LampRangeUpdateReport`** (Usage 0x60) — applies a single color to a contiguous range of lamps. Used by the `set` command to set all lamps at once.
+- **`LampMultiUpdateReport`** (Usage 0x50) — updates individual lamps with independent colors. Used by the `set-lamp` command. Colors are automatically batched based on the device's slot count (derived from report size), with intermediate batches setting `LampUpdateComplete=0` and the final batch setting `LampUpdateComplete=1` so the device applies all updates atomically.
 
 ### LED Page RGB (Usage Page 0x08, Section 11.7)
 
@@ -160,26 +138,15 @@ Simpler protocol — the RGB LED collection (Usage 0x52) directly contains:
 - Green LED Channel (Usage 0x55)
 - LED Intensity (Usage 0x56, optional)
 
-No autonomous mode or lamp enumeration. Both Feature and Output report types
-are supported (auto-detected from the descriptor). Color and intensity values
-are automatically scaled to the device's declared LogicalMaximum (the spec
-recommends logical max 100 for LED Intensity).
+No autonomous mode or lamp enumeration. Both Feature and Output report types are supported (auto-detected from the descriptor). Color and intensity values are automatically scaled to the device's declared LogicalMaximum (the spec recommends logical max 100 for LED Intensity).
 
 ### MinUpdateInterval
 
-LampArray devices report a `MinUpdateIntervalInMicroseconds` (visible via
-`hid-rgb-ctl get`). When performing rapid sequential updates (e.g. animation
-loops), callers should wait at least this long between updates. The spec
-requires the host to not send more than one `LampUpdateComplete` per interval.
-Since each CLI invocation is a separate process, this cannot be enforced
-automatically — scripts should add appropriate delays between calls.
+LampArray devices report a `MinUpdateIntervalInMicroseconds` (visible via `hid-rgb-ctl get`). When performing rapid sequential updates (e.g. animation loops), callers should wait at least this long between updates. The spec requires the host to not send more than one `LampUpdateComplete` per interval. Since each CLI invocation is a separate process, this cannot be enforced automatically — scripts should add appropriate delays between calls.
 
 ## Examples
 
-See [`examples/`](examples/) for scripts that use `hid-rgb-ctl` for lighting
-effects, including `rainbow.sh` (smooth rainbow gradient loop). When writing
-animation loops, respect the device's `MinUpdateIntervalInMicroseconds`
-(see [MinUpdateInterval](#minupdateinterval) above).
+See [`examples/`](examples/) for scripts that use `hid-rgb-ctl` for lighting effects, including `rainbow.sh` (smooth rainbow gradient loop). When writing animation loops, respect the device's `MinUpdateIntervalInMicroseconds` (see [MinUpdateInterval](#minupdateinterval) above).
 
 ## Library Usage
 
@@ -212,10 +179,8 @@ hid-rgb-ctl = { git = "https://github.com/xz-dev/hid-rgb-ctl.git" }
 
 ## References
 
-- [USB HID Usage Tables v1.4](https://www.usb.org/sites/default/files/hut1_4.pdf) —
-  Section 26 (Lighting and Illumination), Section 11.7 (Multicolor RGB LED)
-- [Microsoft Dynamic Lighting](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/dynamic-lighting-devices) —
-  Windows implementation guide for the same HID LampArray standard
+- [USB HID Usage Tables v1.4](https://www.usb.org/sites/default/files/hut1_4.pdf) — Section 26 (Lighting and Illumination), Section 11.7 (Multicolor RGB LED)
+- [Microsoft Dynamic Lighting](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/dynamic-lighting-devices) — Windows implementation guide for the same HID LampArray standard
 
 ## License
 
