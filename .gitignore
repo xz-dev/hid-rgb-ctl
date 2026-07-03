@@ -4,3 +4,6 @@
 # Cargo lock is committed for binary crates
 # (uncomment if this becomes a library-only crate)
 # Cargo.lock
+
+# Local pi agent state
+/.pi/

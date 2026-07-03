@@ -5,6 +5,41 @@
 
 use std::fmt;
 
+pub(crate) mod hid_feature_report_name {
+    pub const LAMP_ARRAY_ATTRIBUTES: &str = "LampArrayAttributesReport";
+    pub const LAMP_ATTRIBUTES_REQUEST: &str = "LampAttributesRequestReport";
+    pub const LAMP_ATTRIBUTES_RESPONSE: &str = "LampAttributesResponseReport";
+    pub const LAMP_ARRAY_CONTROL: &str = "LampArrayControlReport";
+    pub const LAMP_RANGE_UPDATE: &str = "LampRangeUpdateReport";
+    pub const LAMP_MULTI_UPDATE: &str = "LampMultiUpdateReport";
+    pub const LED_RGB_FEATURE: &str = "LED RGB Feature report";
+}
+
+/// HID Feature report operation direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HidFeatureOperation {
+    /// Read a Feature report with HID GET_REPORT / HIDIOCGFEATURE.
+    Get,
+    /// Write a Feature report with HID SET_REPORT / HIDIOCSFEATURE.
+    Set,
+}
+
+impl HidFeatureOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Set => "SET",
+        }
+    }
+
+    fn request_name(self) -> &'static str {
+        match self {
+            Self::Get => "GET_REPORT",
+            Self::Set => "SET_REPORT",
+        }
+    }
+}
+
 /// All errors that can occur in hid-rgb-ctl.
 #[derive(Debug)]
 pub enum Error {
@@ -32,12 +67,37 @@ pub enum Error {
     },
     /// Attempted to write to an Input-only report (device-to-host).
     UnsupportedReportType,
+    /// HID Feature report GET/SET failed.
+    HidFeatureIo {
+        operation: HidFeatureOperation,
+        report_name: &'static str,
+        report_id: u8,
+        source: std::io::Error,
+    },
     /// Invalid subcommand or argument.
     InvalidArgument(String),
     /// Wrapped I/O error.
     Io(std::io::Error),
     /// Wrapped lexopt argument parsing error.
     Arg(lexopt::Error),
+}
+
+impl Error {
+    pub(crate) fn is_lamp_array_control_get_stall(&self) -> bool {
+        if let Self::HidFeatureIo {
+            operation,
+            report_name,
+            source,
+            ..
+        } = self
+        {
+            *operation == HidFeatureOperation::Get
+                && *report_name == hid_feature_report_name::LAMP_ARRAY_CONTROL
+                && source.raw_os_error() == Some(libc::EPIPE)
+        } else {
+            false
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -94,6 +154,40 @@ impl fmt::Display for Error {
             Self::UnsupportedReportType => {
                 write!(f, "Cannot write to an Input report (device-to-host only)")
             }
+            Self::HidFeatureIo {
+                operation,
+                report_name,
+                report_id,
+                source,
+            } => {
+                if source.raw_os_error() == Some(libc::EPIPE) {
+                    write!(
+                        f,
+                        "{} HID Feature report {report_name} (report ID 0x{report_id:02x}) \
+                         was stalled by the device (EPIPE / Broken pipe): {source}. \
+                         The device rejected the HID {} request",
+                        operation.as_str(),
+                        operation.request_name()
+                    )?;
+                    if *report_name == hid_feature_report_name::LAMP_ARRAY_CONTROL {
+                        write!(
+                            f,
+                            "\nFor LampArray autonomous mode, this can mean the device is \
+                             not in host-controlled / Dynamic Lighting mode, or the firmware \
+                             does not support this control report in its current state."
+                        )
+                    } else {
+                        write!(f, ".")
+                    }
+                } else {
+                    write!(
+                        f,
+                        "{} HID Feature report {report_name} (report ID 0x{report_id:02x}) \
+                         failed: {source}",
+                        operation.as_str()
+                    )
+                }
+            }
             Self::InvalidArgument(msg) => {
                 write!(f, "{msg}")
             }
@@ -106,6 +200,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::HidFeatureIo { source, .. } => Some(source),
             Self::Io(e) => Some(e),
             Self::Arg(e) => Some(e),
             _ => None,

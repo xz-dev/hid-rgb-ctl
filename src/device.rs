@@ -11,7 +11,7 @@ use std::os::unix::io::AsRawFd;
 use crate::descriptor::{
     DeviceInfo, DeviceKind, LampArrayReports, LedRgbChannelInfo, ReportInfo, ReportType,
 };
-use crate::error::{Error, Result};
+use crate::error::{hid_feature_report_name, Error, HidFeatureOperation, Result};
 
 // Linux HIDRAW ioctl numbers
 // HIDIOCGFEATURE = _IOC(_IOC_READ|_IOC_WRITE, 'H', 0x07, len)
@@ -89,6 +89,15 @@ pub struct LampColor {
     pub intensity: u8,
 }
 
+/// LampArray autonomous-mode SET result.
+#[derive(Debug)]
+pub(crate) enum AutonomousModeSetResult {
+    /// The device accepted the SET and returned a readback value.
+    Verified(bool),
+    /// The device accepted the SET, but stalled the readback GET.
+    ReadbackStalled(Error),
+}
+
 /// LampArray device attributes (Section 26.2).
 #[derive(Debug, Clone)]
 pub struct LampArrayAttributes {
@@ -120,6 +129,31 @@ struct HidrawFd {
     fd: std::fs::File,
 }
 
+trait HidFeatureTransport {
+    fn raw_feat_get(&self, report_id: u8, size: usize) -> std::io::Result<Vec<u8>>;
+    fn raw_feat_set(&self, buf: &[u8]) -> std::io::Result<()>;
+
+    fn feat_get(&self, report_id: u8, size: usize, report_name: &'static str) -> Result<Vec<u8>> {
+        self.raw_feat_get(report_id, size)
+            .map_err(|source| Error::HidFeatureIo {
+                operation: HidFeatureOperation::Get,
+                report_name,
+                report_id,
+                source,
+            })
+    }
+
+    fn feat_set(&self, buf: &[u8], report_name: &'static str) -> Result<()> {
+        self.raw_feat_set(buf)
+            .map_err(|source| Error::HidFeatureIo {
+                operation: HidFeatureOperation::Set,
+                report_name,
+                report_id: buf.first().copied().unwrap_or(0),
+                source,
+            })
+    }
+}
+
 impl HidrawFd {
     fn open(path: &str) -> Result<Self> {
         let fd = OpenOptions::new()
@@ -138,8 +172,19 @@ impl HidrawFd {
         Ok(Self { fd })
     }
 
-    /// Read a HID Feature report (HIDIOCGFEATURE).
-    fn feat_get(&self, report_id: u8, size: usize) -> Result<Vec<u8>> {
+    /// Write a HID Output report via write() syscall.
+    ///
+    /// On Linux HIDRAW, Output reports are sent by writing directly to the fd
+    /// (as opposed to Feature reports which use ioctl).
+    fn output_set(&self, buf: &[u8]) -> Result<()> {
+        use std::io::Write;
+        (&self.fd).write_all(buf)?;
+        Ok(())
+    }
+}
+
+impl HidFeatureTransport for HidrawFd {
+    fn raw_feat_get(&self, report_id: u8, size: usize) -> std::io::Result<Vec<u8>> {
         let buf_len = size + 1; // +1 for report ID
         let mut buf = vec![0u8; buf_len];
         buf[0] = report_id;
@@ -151,7 +196,7 @@ impl HidrawFd {
             )
         };
         if ret < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(std::io::Error::last_os_error());
         }
         // Truncate to the actual number of bytes returned by the kernel.
         // The Linux HIDRAW driver returns the real transfer size; if the
@@ -162,8 +207,7 @@ impl HidrawFd {
         Ok(buf)
     }
 
-    /// Write a HID Feature report (HIDIOCSFEATURE).
-    fn feat_set(&self, buf: &[u8]) -> Result<()> {
+    fn raw_feat_set(&self, buf: &[u8]) -> std::io::Result<()> {
         let ret = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
@@ -172,18 +216,8 @@ impl HidrawFd {
             )
         };
         if ret < 0 {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(std::io::Error::last_os_error());
         }
-        Ok(())
-    }
-
-    /// Write a HID Output report via write() syscall.
-    ///
-    /// On Linux HIDRAW, Output reports are sent by writing directly to the fd
-    /// (as opposed to Feature reports which use ioctl).
-    fn output_set(&self, buf: &[u8]) -> Result<()> {
-        use std::io::Write;
-        (&self.fd).write_all(buf)?;
         Ok(())
     }
 }
@@ -283,9 +317,13 @@ impl<'a> LampArrayDevice<'a> {
         self.get_attributes_with_fd(&fd)
     }
 
-    fn get_attributes_with_fd(&self, fd: &HidrawFd) -> Result<LampArrayAttributes> {
+    fn get_attributes_with_fd(&self, fd: &impl HidFeatureTransport) -> Result<LampArrayAttributes> {
         let rinfo = require_report(&self.reports().attributes, "attributes")?;
-        let buf = fd.feat_get(rinfo.report_id, rinfo.size)?;
+        let buf = fd.feat_get(
+            rinfo.report_id,
+            rinfo.size,
+            hid_feature_report_name::LAMP_ARRAY_ATTRIBUTES,
+        )?;
 
         // Minimum size: ReportId(1) + LampCount(2) + 5×u32(20) = 23 bytes
         // Verified against Microsoft reference LampArrayAttributesReport struct.
@@ -326,15 +364,23 @@ impl<'a> LampArrayDevice<'a> {
         self.get_lamp_with_fd(&fd, index)
     }
 
-    fn get_lamp_with_fd(&self, fd: &HidrawFd, index: u16) -> Result<LampAttributes> {
+    fn get_lamp_with_fd(
+        &self,
+        fd: &impl HidFeatureTransport,
+        index: u16,
+    ) -> Result<LampAttributes> {
         let req_info = require_report(&self.reports().attr_request, "attr_request")?;
         let mut req_buf = vec![0u8; req_info.size + 1];
         req_buf[0] = req_info.report_id;
         req_buf[1..3].copy_from_slice(&index.to_le_bytes());
-        fd.feat_set(&req_buf)?;
+        fd.feat_set(&req_buf, hid_feature_report_name::LAMP_ATTRIBUTES_REQUEST)?;
 
         let resp_info = require_report(&self.reports().attr_response, "attr_response")?;
-        let buf = fd.feat_get(resp_info.report_id, resp_info.size)?;
+        let buf = fd.feat_get(
+            resp_info.report_id,
+            resp_info.size,
+            hid_feature_report_name::LAMP_ATTRIBUTES_RESPONSE,
+        )?;
         let lamp = parse_lamp_response(&buf)?;
 
         // Per Section 26.8.2: "The Host must always check the LampId of
@@ -359,7 +405,7 @@ impl<'a> LampArrayDevice<'a> {
     /// Each response's LampId is validated against the expected sequence.
     fn read_all_lamps_with_fd(
         &self,
-        fd: &HidrawFd,
+        fd: &impl HidFeatureTransport,
         lamp_count: u16,
     ) -> Result<Vec<LampAttributes>> {
         if lamp_count == 0 {
@@ -371,14 +417,18 @@ impl<'a> LampArrayDevice<'a> {
         let mut req_buf = vec![0u8; req_info.size + 1];
         req_buf[0] = req_info.report_id;
         // LampId = 0 (already zeroed)
-        fd.feat_set(&req_buf)?;
+        fd.feat_set(&req_buf, hid_feature_report_name::LAMP_ATTRIBUTES_REQUEST)?;
 
         // Read lamp_count responses; device auto-increments after each.
         let resp_info = require_report(&self.reports().attr_response, "attr_response")?;
         let mut lamps = Vec::with_capacity(lamp_count as usize);
 
         for expected_id in 0..lamp_count {
-            let buf = fd.feat_get(resp_info.report_id, resp_info.size)?;
+            let buf = fd.feat_get(
+                resp_info.report_id,
+                resp_info.size,
+                hid_feature_report_name::LAMP_ATTRIBUTES_RESPONSE,
+            )?;
             let lamp = parse_lamp_response(&buf)?;
             if lamp.lamp_id != expected_id {
                 return Err(Error::LampIdMismatch {
@@ -422,24 +472,59 @@ impl<'a> LampArrayDevice<'a> {
     /// The `LampArrayControlReport` is a Feature report, so it supports both
     /// GET (read) and SET (write) via HIDRAW ioctl.
     pub fn get_autonomous(&self) -> Result<bool> {
-        let ctrl_info = require_report(&self.reports().control, "control")?;
         let fd = HidrawFd::open(&self.info.hidraw_path)?;
-        let buf = fd.feat_get(ctrl_info.report_id, ctrl_info.size)?;
+        self.get_autonomous_with_fd(&fd)
+    }
+
+    fn get_autonomous_with_fd(&self, fd: &impl HidFeatureTransport) -> Result<bool> {
+        let ctrl_info = require_report(&self.reports().control, "control")?;
+        let buf = fd.feat_get(
+            ctrl_info.report_id,
+            ctrl_info.size,
+            hid_feature_report_name::LAMP_ARRAY_CONTROL,
+        )?;
         // LampArrayControlReport layout (MS reference Report 6):
         //   [ReportID(8), AutonomousMode(8)]
         // 0 = host control, non-zero = autonomous.
         Ok(buf.get(1).copied().unwrap_or(0) != 0)
     }
 
-    fn set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
+    fn set_autonomous_with_fd(&self, fd: &impl HidFeatureTransport, enabled: bool) -> Result<()> {
         require_report(&self.reports().control, "control")?;
         self.try_set_autonomous_with_fd(fd, enabled)
+    }
+
+    fn set_autonomous_and_readback_with_fd(
+        &self,
+        fd: &impl HidFeatureTransport,
+        enabled: bool,
+    ) -> Result<AutonomousModeSetResult> {
+        self.set_autonomous_with_fd(fd, enabled)?;
+        match self.get_autonomous_with_fd(fd) {
+            Ok(readback) => Ok(AutonomousModeSetResult::Verified(readback)),
+            Err(e) if e.is_lamp_array_control_get_stall() => {
+                Ok(AutonomousModeSetResult::ReadbackStalled(e))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(crate) fn set_autonomous_and_readback(
+        &self,
+        enabled: bool,
+    ) -> Result<AutonomousModeSetResult> {
+        let fd = HidrawFd::open(&self.info.hidraw_path)?;
+        self.set_autonomous_and_readback_with_fd(&fd, enabled)
     }
 
     /// Try to set AutonomousMode; silently succeeds if the device has
     /// no LampArrayControlReport (Section 26.10.1: "If this field is
     /// absent, it means no autonomous mode is supported.").
-    fn try_set_autonomous_with_fd(&self, fd: &HidrawFd, enabled: bool) -> Result<()> {
+    fn try_set_autonomous_with_fd(
+        &self,
+        fd: &impl HidFeatureTransport,
+        enabled: bool,
+    ) -> Result<()> {
         let ctrl_info = match &self.reports().control {
             Some(info) => info,
             None => return Ok(()),
@@ -447,7 +532,7 @@ impl<'a> LampArrayDevice<'a> {
         let mut buf = vec![0u8; ctrl_info.size + 1];
         buf[0] = ctrl_info.report_id;
         buf[1] = if enabled { 0x01 } else { 0x00 };
-        fd.feat_set(&buf)
+        fd.feat_set(&buf, hid_feature_report_name::LAMP_ARRAY_CONTROL)
     }
 
     /// Set all lamps to a uniform color.
@@ -517,7 +602,7 @@ impl<'a> LampArrayDevice<'a> {
         buf[8] = scale_u8(b, max_b);
         buf[9] = scale_u8(intensity, max_i);
 
-        fd.feat_set(&buf)
+        fd.feat_set(&buf, hid_feature_report_name::LAMP_RANGE_UPDATE)
     }
 
     /// Set individual lamp colors using LampMultiUpdateReport (Section 26.11.1).
@@ -644,7 +729,7 @@ impl<'a> LampArrayDevice<'a> {
                 buf[off + 3] = c.intensity;
             }
 
-            fd.feat_set(&buf)?;
+            fd.feat_set(&buf, hid_feature_report_name::LAMP_MULTI_UPDATE)?;
         }
 
         Ok(())
@@ -732,7 +817,7 @@ impl<'a> LedRgbDevice<'a> {
         }
 
         match ch.report_type {
-            ReportType::Feature => fd.feat_set(&buf),
+            ReportType::Feature => fd.feat_set(&buf, hid_feature_report_name::LED_RGB_FEATURE),
             ReportType::Output => fd.output_set(&buf),
             ReportType::Input => Err(Error::UnsupportedReportType),
         }
@@ -754,5 +839,125 @@ impl<'a> LedRgbDevice<'a> {
     /// One-line summary for CLI listing.
     pub fn summary(&self) -> &'static str {
         "LED RGB"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    struct FakeHidFeatureTransport {
+        get_results: RefCell<Vec<std::io::Result<Vec<u8>>>>,
+        set_results: RefCell<Vec<std::io::Result<()>>>,
+        get_calls: RefCell<Vec<(u8, usize)>>,
+        set_calls: RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl FakeHidFeatureTransport {
+        fn new() -> Self {
+            Self {
+                get_results: RefCell::new(Vec::new()),
+                set_results: RefCell::new(Vec::new()),
+                get_calls: RefCell::new(Vec::new()),
+                set_calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_get_result(self, result: std::io::Result<Vec<u8>>) -> Self {
+            self.get_results.borrow_mut().push(result);
+            self
+        }
+
+        fn with_set_result(self, result: std::io::Result<()>) -> Self {
+            self.set_results.borrow_mut().push(result);
+            self
+        }
+    }
+
+    impl HidFeatureTransport for FakeHidFeatureTransport {
+        fn raw_feat_get(&self, report_id: u8, size: usize) -> std::io::Result<Vec<u8>> {
+            self.get_calls.borrow_mut().push((report_id, size));
+            self.get_results.borrow_mut().remove(0)
+        }
+
+        fn raw_feat_set(&self, buf: &[u8]) -> std::io::Result<()> {
+            self.set_calls.borrow_mut().push(buf.to_vec());
+            if self.set_results.borrow().is_empty() {
+                Ok(())
+            } else {
+                self.set_results.borrow_mut().remove(0)
+            }
+        }
+    }
+
+    fn lamp_array_info_with_control_report() -> DeviceInfo {
+        DeviceInfo {
+            hidraw_path: "/dev/fake-hidraw".to_string(),
+            name: "Fake LampArray".to_string(),
+            kind: DeviceKind::LampArray(LampArrayReports {
+                control: Some(ReportInfo {
+                    report_id: 0x06,
+                    size: 1,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn autonomous_get_wraps_hid_stall_with_control_report_context() {
+        let info = lamp_array_info_with_control_report();
+        let dev = LampArrayDevice::new(&info);
+        let transport = FakeHidFeatureTransport::new()
+            .with_get_result(Err(std::io::Error::from_raw_os_error(libc::EPIPE)));
+
+        let err = dev.get_autonomous_with_fd(&transport).unwrap_err();
+
+        assert_eq!(*transport.get_calls.borrow(), vec![(0x06, 1)]);
+        assert!(err.is_lamp_array_control_get_stall());
+        match &err {
+            Error::HidFeatureIo {
+                operation,
+                report_name,
+                report_id,
+                source,
+            } => {
+                assert_eq!(*operation, HidFeatureOperation::Get);
+                assert_eq!(*report_name, hid_feature_report_name::LAMP_ARRAY_CONTROL);
+                assert_eq!(*report_id, 0x06);
+                assert_eq!(source.raw_os_error(), Some(libc::EPIPE));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let text = err.to_string();
+        assert!(text.contains("GET HID Feature report LampArrayControlReport (report ID 0x06)"));
+        assert!(text.contains("was stalled by the device (EPIPE / Broken pipe)"));
+        assert!(text.contains("The device rejected the HID GET_REPORT request"));
+        assert!(text.contains("\nFor LampArray autonomous mode,"));
+        assert!(text.contains("not in host-controlled / Dynamic Lighting mode"));
+    }
+
+    #[test]
+    fn autonomous_set_reports_readback_stall_after_successful_set() {
+        let info = lamp_array_info_with_control_report();
+        let dev = LampArrayDevice::new(&info);
+        let transport = FakeHidFeatureTransport::new()
+            .with_set_result(Ok(()))
+            .with_get_result(Err(std::io::Error::from_raw_os_error(libc::EPIPE)));
+
+        let result = dev
+            .set_autonomous_and_readback_with_fd(&transport, false)
+            .unwrap();
+
+        assert_eq!(*transport.set_calls.borrow(), vec![vec![0x06, 0x00]]);
+        assert_eq!(*transport.get_calls.borrow(), vec![(0x06, 1)]);
+
+        let AutonomousModeSetResult::ReadbackStalled(err) = result else {
+            panic!("expected readback stall after successful SET")
+        };
+        assert!(err.is_lamp_array_control_get_stall());
+        assert!(err.to_string().contains("\nFor LampArray autonomous mode,"));
     }
 }

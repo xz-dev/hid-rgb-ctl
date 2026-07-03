@@ -105,6 +105,16 @@ Then reload:
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
+## Troubleshooting
+
+### Colors flash briefly, then revert
+
+If `hid-rgb-ctl set ...` appears to change the keyboard for a moment but the old effect immediately returns, the device may not be in host-controlled / Dynamic Lighting mode. Some firmware keeps its own lighting engine authoritative until a vendor UI, firmware hotkey, or other device-specific mode switch hands control to the standard HID LampArray interface.
+
+When diagnosing this, first check whether Windows Dynamic Lighting can control the keyboard after switching the vendor lighting UI to its Dynamic Lighting / host-controlled mode. If that works but Linux does not after reboot, the reboot may be resetting the firmware mode; it still suggests the LampArray path can work once the device is in the right mode.
+
+This project intentionally targets standard HID LampArray / Dynamic Lighting and LED Page RGB protocols, not vendor-private lighting protocols. See [issue #10](https://github.com/xz-dev/hid-rgb-ctl/issues/10) for one Lenovo example where a vendor/private mode switch may be required before LampArray writes become authoritative.
+
 ## Verified Devices
 
 | Device | Bus | VID:PID | Protocol | Lamps | Status |

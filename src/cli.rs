@@ -6,7 +6,7 @@
 use lexopt::prelude::*;
 
 use crate::descriptor::{DeviceInfo, DeviceKind};
-use crate::device::{LampArrayDevice, LampColor, LedRgbDevice};
+use crate::device::{AutonomousModeSetResult, LampArrayDevice, LampColor, LedRgbDevice};
 use crate::error::Error;
 
 // --- Color presets ---
@@ -221,32 +221,44 @@ fn cmd_set_lamp(info: &DeviceInfo, lamps: &[(u16, String)], intensity: u8) -> Re
     }
 }
 
+fn autonomous_state_text(enabled: bool) -> &'static str {
+    if enabled {
+        "on (device controls)"
+    } else {
+        "off (host controls)"
+    }
+}
+
 fn cmd_auto(info: &DeviceInfo, enabled: Option<bool>) -> Result<(), Error> {
     match &info.kind {
         DeviceKind::LampArray(_) => {
             let dev = LampArrayDevice::new(info);
-            let current = match enabled {
+            match enabled {
                 Some(val) => {
-                    dev.set_autonomous(val)?;
-                    let readback = dev.get_autonomous()?;
-                    if readback != val {
-                        eprintln!(
-                            "[Warning] device reports {}, firmware may not \
-                             persist this state via feature report",
-                            if readback { "on" } else { "off" }
-                        );
+                    match dev.set_autonomous_and_readback(val)? {
+                        AutonomousModeSetResult::Verified(readback) => {
+                            if readback != val {
+                                eprintln!(
+                                    "[Warning] device reports {}, firmware may not \
+                                     persist this state via feature report",
+                                    if readback { "on" } else { "off" }
+                                );
+                            }
+                            println!("Autonomous mode: {}", autonomous_state_text(readback));
+                        }
+                        AutonomousModeSetResult::ReadbackStalled(e) => {
+                            eprintln!("[Warning] Could not verify autonomous mode after SET: {e}");
+                            println!("Autonomous mode requested: {}", autonomous_state_text(val));
+                        }
                     }
-                    val
+                    Ok(())
                 }
-                None => dev.get_autonomous()?,
-            };
-            let state = if current {
-                "on (device controls)"
-            } else {
-                "off (host controls)"
-            };
-            println!("Autonomous mode: {state}");
-            Ok(())
+                None => {
+                    let current = dev.get_autonomous()?;
+                    println!("Autonomous mode: {}", autonomous_state_text(current));
+                    Ok(())
+                }
+            }
         }
         DeviceKind::LedRgb(_) => Err(Error::NoAutonomousMode),
     }
